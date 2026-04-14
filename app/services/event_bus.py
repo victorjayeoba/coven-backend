@@ -42,3 +42,5 @@ bus = EventBus()
 SWAP_EVENT = "swap"
 SIGNAL_FIRED = "signal.fired"
 SIGNAL_SCORED = "signal.scored"
+TRADE_OPENED = "trade.opened"
+TRADE_CLOSED = "trade.closed"

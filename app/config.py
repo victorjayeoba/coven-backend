@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     # Set ENABLE_TX_POLLER=true in .env to force it on (e.g. if WSS is down).
     enable_tx_poller: bool = False
 
+    # Auth / JWT
+    jwt_secret: str = "dev-change-me-please-super-secret-key"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24  # 24h
+
+    cookie_name: str = "coven_session"
+    cookie_secure: bool = False
+    cookie_samesite: str = "lax"
+
     mongo_uri: str = "mongodb://localhost:27017"
     mongo_db: str = "contagion"
 
