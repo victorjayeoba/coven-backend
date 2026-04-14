@@ -9,6 +9,7 @@ from app.db import mongo
 from app.jobs import position_monitor, tx_poller, ws_listener
 from app.routers import (
     auth,
+    backtests,
     clusters,
     health,
     settings as settings_router,
@@ -85,6 +86,7 @@ app.include_router(wallets.router)
 app.include_router(clusters.router)
 app.include_router(tokens.router)
 app.include_router(trades.router)
+app.include_router(backtests.router)
 app.include_router(settings_router.router)
 
 
