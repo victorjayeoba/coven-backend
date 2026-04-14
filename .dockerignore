@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.venv
+venv
+.env
+scripts/.env
+scripts/validate_output.json
+.pytest_cache
+.mypy_cache
