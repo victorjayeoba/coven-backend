@@ -101,21 +101,44 @@ class UnionFind:
 # Phase 1 — fetch smart wallets
 # ---------------------------------------------------------------------
 
+MIN_TOTAL_VOLUME_USD = 10_000      # filter out dust traders
+MIN_TOTAL_PROFIT_USD = 1_000       # wallet must have made real money
+
+
 async def fetch_smart_wallets(
     ave: AveClient,
     chain: str,
     limit: int,
 ) -> list[dict]:
-    """Return up to `limit` smart wallets for a chain, sorted by profit rate."""
+    """
+    Return up to `limit` smart wallets for a chain.
+    Sorted by total_profit (absolute USD), filtered to meaningful traders.
+    """
     try:
         raw = await ave.smart_wallet_list(
-            chain=chain, sort="total_profit_rate", sort_dir="desc"
+            chain=chain, sort="total_profit", sort_dir="desc"
         )
     except Exception as e:
         print(f"[graph] smart_wallet_list failed for {chain}: {e}")
         return []
     items = _coerce_list(raw)
-    return items[:limit]
+
+    def _num(item: dict, key: str) -> float:
+        try:
+            return float(item.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    filtered = [
+        i for i in items
+        if _num(i, "total_volume") >= MIN_TOTAL_VOLUME_USD
+        and _num(i, "total_profit") >= MIN_TOTAL_PROFIT_USD
+    ]
+    print(
+        f"[graph] {chain}: {len(items)} candidates → "
+        f"{len(filtered)} after volume/profit filter"
+    )
+    return filtered[:limit]
 
 
 # ---------------------------------------------------------------------

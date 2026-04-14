@@ -1,14 +1,15 @@
-from passlib.context import CryptContext
-
-_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 
 def hash_password(password: str) -> str:
-    return _pwd.hash(password)
+    # bcrypt has a 72-byte hard limit on input. Truncate defensively.
+    pw = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pw, bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
     try:
-        return _pwd.verify(password, hashed)
+        pw = password.encode("utf-8")[:72]
+        return bcrypt.checkpw(pw, hashed.encode("utf-8"))
     except Exception:
         return False

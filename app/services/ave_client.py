@@ -180,6 +180,34 @@ class AveClient:
             },
         )
 
+    async def wallet_token_tx(
+        self,
+        wallet_address: str,
+        chain: str,
+        token_address: str,
+        from_time: int | None = None,
+        to_time: int | None = None,
+        page_size: int = 100,
+        last_id: str | None = None,
+    ):
+        """
+        Wallet's buy/sell transaction history on a specific token. 100 CU.
+        Used by the backtester for behavior-based exit timing.
+        """
+        params: dict = {
+            "wallet_address": wallet_address,
+            "chain": chain,
+            "token_address": token_address,
+            "page_size": page_size,
+        }
+        if from_time is not None:
+            params["from_time"] = from_time
+        if to_time is not None:
+            params["to_time"] = to_time
+        if last_id:
+            params["last_id"] = last_id
+        return await self._get("/address/tx", params=params)
+
     # ---- pump tracking ----
 
     async def tokens_platform(

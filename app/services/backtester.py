@@ -35,9 +35,14 @@ DAYS_BACK = 7                       # entries newer than now-DAYS_BACK are eligi
 HOLD_BUFFER_HOURS = 24              # need at least this much forward price data
 TIME_WINDOW_SECONDS = 60 * 60       # cluster entry window = 60 min
 MIN_CLUSTER_WALLETS = 2             # need 2+ from same cluster for a firing
-HOLD_WINDOW_HOURS = 24              # how far forward to evaluate exit
+HOLD_WINDOW_HOURS = 24              # fallback hold if no cluster exit detected
 PEAK_INTERVAL_MIN = 15              # kline granularity
 PARALLEL = 10                       # concurrent walletinfo requests
+
+# Behavior-based exit settings
+EXIT_DISTRIBUTION_FRACTION = 0.5    # exit when 50% of cluster wallets have sold
+STOP_LOSS_PCT = -30.0               # hard stop at -30% from entry (safety net)
+MAX_HOLD_HOURS = 72                 # never hold longer than this
 
 
 # ---------------------------------------------------------------------
@@ -45,13 +50,34 @@ PARALLEL = 10                       # concurrent walletinfo requests
 # ---------------------------------------------------------------------
 
 def _as_unix_seconds(val: Any) -> float | None:
+    """Accept numeric unix (s or ms), or ISO-8601 string."""
+    if val is None:
+        return None
+    # Numeric (int/float/numeric string)
     try:
         v = float(val)
+        if v > 1e12:
+            v = v / 1000.0
+        return v if v > 0 else None
     except (TypeError, ValueError):
-        return None
-    if v > 1e12:
-        v = v / 1000.0
-    return v if v > 0 else None
+        pass
+    # ISO-8601 string like "2026-04-13T01:21:22.000237Z"
+    if isinstance(val, str):
+        s = val.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def _parse_tx_time(tx: dict) -> float | None:
+    return _as_unix_seconds(
+        tx.get("time")
+        or tx.get("tx_time")
+        or tx.get("block_time")
+        or tx.get("timestamp")
+    )
 
 
 def _coerce_list(data: Any) -> list[dict]:
@@ -77,6 +103,23 @@ def _candle_close(c: Any) -> float | None:
     if isinstance(c, list) and len(c) >= 5:
         try:
             return float(c[4])
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _candle_low(c: Any) -> float | None:
+    if isinstance(c, dict):
+        for k in ("low", "l", "low_price"):
+            v = c.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+    if isinstance(c, list) and len(c) >= 4:
+        try:
+            return float(c[3])
         except (TypeError, ValueError):
             pass
     return None
@@ -279,6 +322,77 @@ def _find_firings(
 # Simulate trade outcome
 # ---------------------------------------------------------------------
 
+async def _detect_cluster_exit(
+    ave: AveClient,
+    fire: dict,
+    entry_ts: float,
+    search_end_ts: float,
+) -> tuple[float | None, str, int]:
+    """
+    For each entry wallet, fetch its buy/sell history on this token after entry.
+    Return (exit_ts, reason, sellers_count):
+      exit_ts = timestamp when EXIT_DISTRIBUTION_FRACTION of entry wallets had sold
+      reason  = 'cluster_distribution' if reached threshold, else 'no_exit'
+      sellers_count = how many cluster wallets had sold at that point
+    """
+    chain = fire.get("chain") or _chain_from_token_id(fire["token_id"])
+    # Token contract = token_id without the chain suffix
+    token_contract = fire["token_id"].rsplit("-", 1)[0]
+
+    entry_wallets = fire["wallets_involved"]
+    threshold = max(1, int(len(entry_wallets) * EXIT_DISTRIBUTION_FRACTION))
+
+    # First-sell timestamp per wallet
+    first_sell_ts: list[float] = []
+
+    sem = asyncio.Semaphore(3)  # rate-polite
+
+    target_token_lower = token_contract.lower()
+
+    async def _for_wallet(addr: str) -> float | None:
+        async with sem:
+            try:
+                raw = await ave.wallet_token_tx(
+                    wallet_address=addr,
+                    chain=chain,
+                    token_address=token_contract,
+                    from_time=int(entry_ts),
+                    to_time=int(search_end_ts),
+                    page_size=100,
+                )
+            except Exception:
+                return None
+        txs = _coerce_list(raw)
+        earliest = None
+        for tx in txs:
+            # A SELL = wallet SENT the target token
+            # (from_address == target token contract)
+            from_addr = (tx.get("from_address") or "").lower()
+            if from_addr != target_token_lower:
+                continue
+
+            ts = _parse_tx_time(tx)
+            if ts and ts >= entry_ts and (earliest is None or ts < earliest):
+                earliest = ts
+        return earliest
+
+    results = await asyncio.gather(*[_for_wallet(a) for a in entry_wallets])
+    for ts in results:
+        if ts is not None:
+            first_sell_ts.append(ts)
+
+    if len(first_sell_ts) < threshold:
+        return None, "no_exit", len(first_sell_ts)
+
+    first_sell_ts.sort()
+    exit_ts = first_sell_ts[threshold - 1]  # moment threshold was reached
+    return exit_ts, "cluster_distribution", len(first_sell_ts)
+
+
+def _chain_from_token_id(token_id: str) -> str:
+    return token_id.rsplit("-", 1)[-1] if "-" in token_id else ""
+
+
 async def _simulate(
     ave: AveClient,
     fire: dict,
@@ -286,51 +400,117 @@ async def _simulate(
 ) -> dict:
     token_id = fire["token_id"]
     entry_ts = fire["first_entry_ts"]
-    exit_ts = entry_ts + HOLD_WINDOW_HOURS * 3600
+    max_exit_ts = entry_ts + MAX_HOLD_HOURS * 3600
 
+    # Candles — pull with hourly granularity to cover the full hold window
     try:
         raw_candles = await ave.klines_by_token(
-            token_id, interval=PEAK_INTERVAL_MIN, limit=500
+            token_id, interval=60, limit=500
         )
     except Exception:
         raw_candles = []
     candles = _coerce_list(raw_candles) or raw_candles or []
 
+    # Token detail — TVL + age for proper conviction scoring
+    tvl_usd: float | None = None
+    token_age_hours: float | None = None
+    try:
+        td = await ave.token_detail(token_id)
+        if isinstance(td, dict):
+            tok = td.get("token") if isinstance(td.get("token"), dict) else td
+            try:
+                tvl_usd = float(tok.get("main_pair_tvl") or tok.get("tvl") or 0)
+                if tvl_usd <= 0:
+                    tvl_usd = None
+            except (TypeError, ValueError):
+                pass
+            launch = tok.get("launch_at") or tok.get("created_at")
+            launch_ts = _as_unix_seconds(launch)
+            if launch_ts and launch_ts < entry_ts:
+                token_age_hours = max(0.0, (entry_ts - launch_ts) / 3600.0)
+    except Exception:
+        pass
+
     entry_price = _price_at(candles, entry_ts)
-    peak, final = _price_window(candles, entry_ts, exit_ts)
+    peak_within_max, _ = _price_window(candles, entry_ts, max_exit_ts)
 
-    # Realistic exit = 75% of the upside capture (not a peak-timer)
-    if entry_price and peak:
-        realistic_exit = entry_price + (peak - entry_price) * 0.75
-    elif final:
-        realistic_exit = final
-    else:
-        realistic_exit = None
+    # --- BEHAVIOR-BASED EXIT (the real product exit strategy) ---
+    cluster_exit_ts, exit_reason, sellers = await _detect_cluster_exit(
+        ave, fire, entry_ts, max_exit_ts
+    )
 
+    # Find the actual exit point
+    stop_price = (
+        entry_price * (1 + STOP_LOSS_PCT / 100.0) if entry_price else None
+    )
+
+    # Walk candles: look for stop-loss first, then cluster exit.
+    # If neither triggers → the cluster is still holding → fall back to
+    # realistic peak capture (75% of peak) — represents unrealized gains.
+    exit_ts_used = None
+    exit_price = None
+    final_reason = "still_holding"
+
+    candles_sorted = sorted(
+        [
+            (c, _candle_ts(c), _candle_close(c), _candle_low(c))
+            for c in (candles or [])
+            if _candle_ts(c) is not None and _candle_close(c) is not None
+        ],
+        key=lambda t: t[1],
+    )
+
+    for _, ct, cp, clow in candles_sorted:
+        if ct < entry_ts:
+            continue
+        if ct > max_exit_ts:
+            break
+        # Stop-loss: check candle LOW (not just close) — catches flash dumps
+        intra_low = clow if clow is not None else cp
+        if stop_price is not None and intra_low <= stop_price:
+            exit_ts_used = ct
+            exit_price = stop_price   # simulate stop-loss fill at the cap
+            final_reason = "stop_loss"
+            break
+        # Cluster distribution
+        if cluster_exit_ts is not None and ct >= cluster_exit_ts:
+            exit_ts_used = ct
+            exit_price = cp
+            final_reason = exit_reason
+            break
+
+    # Nothing triggered → still holding → realistic exit = 75% of peak capture
+    if exit_ts_used is None and entry_price and peak_within_max is not None:
+        exit_price = entry_price + (peak_within_max - entry_price) * 0.75
+        exit_ts_used = max_exit_ts  # nominal exit at end of window
+        final_reason = "still_holding"
+
+    # Compute metrics
     pnl_pct = None
     peak_pnl_pct = None
-    final_pnl_pct = None
     if entry_price and entry_price > 0:
-        if realistic_exit is not None:
-            pnl_pct = round((realistic_exit / entry_price - 1.0) * 100, 2)
-        if peak is not None:
-            peak_pnl_pct = round((peak / entry_price - 1.0) * 100, 2)
-        if final is not None:
-            final_pnl_pct = round((final / entry_price - 1.0) * 100, 2)
+        if exit_price is not None:
+            pnl_pct = round((exit_price / entry_price - 1.0) * 100, 2)
+        if peak_within_max is not None:
+            peak_pnl_pct = round((peak_within_max / entry_price - 1.0) * 100, 2)
 
     wallet_alphas = [alpha_scores.get(w, 0.0) for w in fire["wallets_involved"]]
     scored = conviction_scorer.score(
         cluster_active=fire["cluster_active_count"],
         cluster_total=fire["cluster_size_total"],
         wallet_alpha_scores=wallet_alphas,
-        risk_score=75,  # at-time risk unknown; assume passing for the sim
-        tvl_usd=None,
-        token_age_hours=None,
+        risk_score=75,
+        tvl_usd=tvl_usd,
+        token_age_hours=token_age_hours,
     )
 
     outcome = "win" if (pnl_pct is not None and pnl_pct > 0) else (
         "loss" if pnl_pct is not None else "no_data"
     )
+
+    hold_hours = None
+    if exit_ts_used is not None:
+        hold_hours = round((exit_ts_used - entry_ts) / 3600.0, 2)
 
     return {
         "token_id": token_id,
@@ -344,17 +524,19 @@ async def _simulate(
         "last_entry_at": datetime.utcfromtimestamp(fire["last_entry_ts"]).isoformat(),
         "time_window_seconds": fire["time_window_seconds"],
         "entry_price_usd": entry_price,
-        "peak_price_usd": peak,
-        "final_price_usd": final,
-        "realistic_exit_usd": realistic_exit,
-        "hold_window_hours": HOLD_WINDOW_HOURS,
+        "exit_price_usd": exit_price,
+        "peak_price_usd": peak_within_max,
+        "exit_reason": final_reason,
+        "cluster_sellers_detected": sellers,
+        "hold_hours": hold_hours,
         "realistic_pnl_pct": pnl_pct,
         "peak_pnl_pct": peak_pnl_pct,
-        "final_pnl_pct": final_pnl_pct,
         "outcome": outcome,
         "conviction_score": scored["conviction_score"],
         "conviction_breakdown": scored["breakdown"],
         "status": scored["status"],
+        "tvl_usd": tvl_usd,
+        "token_age_hours": token_age_hours,
         "wallet_alpha_scores": wallet_alphas,
         "created_at": datetime.utcnow().isoformat(),
     }
@@ -430,8 +612,22 @@ async def run_honest_backtest(
     wins = [r for r in valid if r["outcome"] == "win"]
     losses = [r for r in valid if r["outcome"] == "loss"]
     best = max((r["peak_pnl_pct"] or 0) for r in valid) if valid else 0
-    worst = min((r["final_pnl_pct"] or 0) for r in valid) if valid else 0
+    worst = min((r["realistic_pnl_pct"] or 0) for r in valid) if valid else 0
     avg = sum((r["realistic_pnl_pct"] or 0) for r in valid) / len(valid) if valid else 0
+
+    # Exit-reason breakdown — tells us what the product does most often
+    reason_counts: dict[str, int] = {}
+    for r in valid:
+        reason_counts[r["exit_reason"]] = reason_counts.get(r["exit_reason"], 0) + 1
+
+    # Execution-grade subset (conviction >= 70 = status "exec") — what the
+    # product would actually auto-trade
+    exec_only = [r for r in valid if r.get("conviction_score", 0) >= 70]
+    exec_wins = [r for r in exec_only if r["outcome"] == "win"]
+    exec_avg = (
+        sum((r["realistic_pnl_pct"] or 0) for r in exec_only) / len(exec_only)
+        if exec_only else 0
+    )
 
     summary = {
         "tokens_scanned": len(entries_by_token),
@@ -443,7 +639,15 @@ async def run_honest_backtest(
         "avg_pnl_pct": round(avg, 2),
         "best_pnl_pct": round(best, 2),
         "worst_pnl_pct": round(worst, 2),
+        "exit_reasons": reason_counts,
         "window_days": days_back,
+        # Execution grade — the real product's behavior
+        "exec_count": len(exec_only),
+        "exec_wins": len(exec_wins),
+        "exec_win_rate_pct": (
+            round(len(exec_wins) / len(exec_only) * 100, 2) if exec_only else 0.0
+        ),
+        "exec_avg_pnl_pct": round(exec_avg, 2),
     }
 
     return {
