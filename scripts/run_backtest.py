@@ -58,6 +58,15 @@ async def main() -> None:
         for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
             print(f"    {r:25} {n}")
     print("-" * 60)
+    c = s.get("cluster_stats") or {}
+    a = s.get("alpha_stats") or {}
+    print(f"  CLUSTER  count={c.get('count', 0):3d}  "
+          f"win_rate={c.get('win_rate_pct', 0):5.1f}%  "
+          f"avg_pnl={c.get('avg_pnl_pct', 0):+6.2f}%")
+    print(f"  ALPHA    count={a.get('count', 0):3d}  "
+          f"win_rate={a.get('win_rate_pct', 0):5.1f}%  "
+          f"avg_pnl={a.get('avg_pnl_pct', 0):+6.2f}%")
+    print("-" * 60)
     print("  EXECUTION GRADE (conviction >= 70 — what Coven would auto-trade)")
     print(f"    exec trades:         {s.get('exec_count', 0)}")
     print(f"    exec win rate:       {s.get('exec_win_rate_pct', 0)}%")

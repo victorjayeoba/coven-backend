@@ -19,6 +19,12 @@ class EventBus:
     def subscribe(self, event_type: str, handler: Handler) -> None:
         self._handlers[event_type].append(handler)
 
+    def unsubscribe(self, event_type: str, handler: Handler) -> None:
+        try:
+            self._handlers.get(event_type, []).remove(handler)
+        except ValueError:
+            pass
+
     async def publish(self, event_type: str, payload: dict) -> None:
         handlers = list(self._handlers.get(event_type, ()))
         if not handlers:
@@ -44,3 +50,4 @@ SIGNAL_FIRED = "signal.fired"
 SIGNAL_SCORED = "signal.scored"
 TRADE_OPENED = "trade.opened"
 TRADE_CLOSED = "trade.closed"
+PRICE_UPDATE = "price.update"

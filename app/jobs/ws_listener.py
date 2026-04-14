@@ -34,10 +34,10 @@ WSS_URL = getattr(settings, "ave_wss_url", None) or "wss://wss.ave-api.xyz"
 AVE_API_KEY = settings.ave_api_key
 
 CHAINS = ["solana", "bsc"]
-TRENDING_PER_CHAIN = 15          # fewer trending tokens
-PUMP_NEW_LIMIT = 40              # tokens currently entering pump phase (prime entry targets)
-PUMP_HOT_LIMIT = 20              # tokens hot & pumping
-SUBSCRIPTION_REFRESH_SECONDS = 15 * 60  # re-seed every 15 min
+TRENDING_PER_CHAIN = 30          # trending per chain
+PUMP_NEW_LIMIT = 80              # pump_in_new — prime entry targets (doubled)
+PUMP_HOT_LIMIT = 40              # pump_in_hot — confirmed momentum (doubled)
+SUBSCRIPTION_REFRESH_SECONDS = 5 * 60  # refresh every 5 min (was 15)
 PING_INTERVAL = 20
 RECONNECT_DELAY = 5
 

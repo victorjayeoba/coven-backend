@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import mongo
-from app.jobs import position_monitor, tx_poller, ws_listener
+from app.jobs import position_monitor, price_listener, tx_poller, ws_listener
 from app.routers import (
     auth,
     backtests,
@@ -14,6 +14,7 @@ from app.routers import (
     health,
     settings as settings_router,
     signals,
+    stream,
     tokens,
     trades,
     wallets,
@@ -38,6 +39,7 @@ async def lifespan(_: FastAPI):
     exit_monitor.register()
 
     ws_task = asyncio.create_task(ws_listener.run(), name="ws_listener")
+    price_task = asyncio.create_task(price_listener.run(), name="price_listener")
     pos_task = asyncio.create_task(position_monitor.run(), name="position_monitor")
     tx_task = None
     if settings.enable_tx_poller:
@@ -51,11 +53,13 @@ async def lifespan(_: FastAPI):
     finally:
         # Shutdown
         ws_listener.stop()
+        price_listener.stop()
         position_monitor.stop()
         if tx_task is not None:
             tx_poller.stop()
         await asyncio.gather(
             ws_task,
+            price_task,
             pos_task,
             tx_task if tx_task else asyncio.sleep(0),
             return_exceptions=True,
@@ -87,6 +91,7 @@ app.include_router(clusters.router)
 app.include_router(tokens.router)
 app.include_router(trades.router)
 app.include_router(backtests.router)
+app.include_router(stream.router)
 app.include_router(settings_router.router)
 
 

@@ -83,4 +83,53 @@ async def get_wallet(address: str, _: dict = Depends(get_current_user)):
     w = await db.wallets.find_one({"address": address}, {"_id": 0})
     if not w:
         raise HTTPException(status_code=404, detail="Wallet not in graph")
+
+    # Enrich with cluster info
+    cluster = await db.clusters.find_one(
+        {"wallet_addresses": address}, {"_id": 0}
+    )
+    if cluster:
+        w["cluster"] = {
+            "cluster_id": cluster.get("cluster_id"),
+            "size": cluster.get("size"),
+            "chain": cluster.get("chain"),
+            "wallet_addresses": cluster.get("wallet_addresses") or [],
+        }
+
+    # Find connected wallets (edges)
+    neighbors: list[dict] = []
+    async for e in db.wallet_edges.find(
+        {"$or": [{"wallet_a": address}, {"wallet_b": address}]}
+    ):
+        other = e["wallet_b"] if e["wallet_a"] == address else e["wallet_a"]
+        neighbors.append({
+            "address": other,
+            "shared_count": e.get("shared_count", 0),
+        })
+    neighbors.sort(key=lambda x: -(x["shared_count"] or 0))
+    w["neighbors"] = neighbors[:20]
+
+    # Recent signals this wallet has been part of (live or backtest)
+    recent_signals: list[dict] = []
+    async for s in db.signals.find(
+        {"wallets_involved": address}, {"_id": 1, "token_id": 1, "symbol": 1,
+                                         "chain": 1, "cluster_id": 1,
+                                         "conviction_score": 1, "status": 1,
+                                         "detected_at": 1}
+    ).sort("detected_at", -1).limit(10):
+        s["id"] = str(s.pop("_id"))
+        recent_signals.append(s)
+
+    async for s in db.backtests.find(
+        {"wallets_involved": address}, {"_id": 1, "token_id": 1, "symbol": 1,
+                                         "chain": 1, "cluster_id": 1,
+                                         "conviction_score": 1, "status": 1,
+                                         "first_entry_at": 1, "peak_pnl_pct": 1,
+                                         "realistic_pnl_pct": 1}
+    ).sort("first_entry_at", -1).limit(10):
+        s["id"] = str(s.pop("_id"))
+        s["detected_at"] = s.pop("first_entry_at", None)
+        recent_signals.append(s)
+
+    w["recent_signals"] = recent_signals[:10]
     return w

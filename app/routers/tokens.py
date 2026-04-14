@@ -3,9 +3,68 @@ import asyncio
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from app.auth.dependencies import get_current_user
+from app.db import mongo
 from app.services.ave_client import AveClient
 
 router = APIRouter(prefix="/api/tokens", tags=["tokens"])
+
+
+@router.get("/{token_id}/signals")
+async def token_signals(token_id: str, _: dict = Depends(get_current_user)):
+    """Every live signal and backtest record that fired on this token."""
+    db = mongo.db()
+    out: list[dict] = []
+
+    async for s in db.signals.find({"token_id": token_id}).sort("detected_at", -1):
+        s["id"] = str(s.pop("_id"))
+        s["source"] = "live"
+        out.append(s)
+    async for b in db.backtests.find({"token_id": token_id}).sort(
+        "first_entry_at", -1
+    ):
+        b["id"] = str(b.pop("_id"))
+        b["source"] = "backtest"
+        b["detected_at"] = b.pop("first_entry_at", None)
+        out.append(b)
+
+    return out
+
+
+@router.get("/{token_id}/smart-holders")
+async def token_smart_holders(
+    token_id: str, _: dict = Depends(get_current_user)
+):
+    """Wallets in our graph that currently hold this token."""
+    db = mongo.db()
+    out: list[dict] = []
+    async for w in db.wallets.find(
+        {"tokens.token_id": token_id},
+        {"_id": 0, "address": 1, "chain": 1, "alpha_score": 1,
+         "total_profit": 1, "tokens": 1},
+    ):
+        tokens = w.get("tokens") or []
+        # Find the matching token entry for balance/pnl
+        match = next((t for t in tokens if t.get("token_id") == token_id), {})
+
+        # Cluster lookup
+        cluster = await db.clusters.find_one(
+            {"wallet_addresses": w["address"]},
+            {"_id": 0, "cluster_id": 1},
+        )
+        out.append({
+            "address": w["address"],
+            "chain": w.get("chain"),
+            "alpha_score": w.get("alpha_score", 0.0),
+            "total_profit": w.get("total_profit"),
+            "balance_usd": match.get("balance_usd"),
+            "total_profit_token": match.get("total_profit"),
+            "unrealized_profit_token": match.get("unrealized_profit"),
+            "cluster_id": cluster.get("cluster_id") if cluster else None,
+        })
+
+    # Sort by balance size
+    out.sort(key=lambda h: float(h.get("balance_usd") or 0), reverse=True)
+    return out
 
 
 @router.post("/batch")

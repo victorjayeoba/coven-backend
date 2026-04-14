@@ -299,6 +299,7 @@ def _find_firings(
                 symbol = next((e.get("symbol") for e in window if e.get("symbol")), None)
                 chain = next((e.get("chain") for e in window if e.get("chain")), None)
                 firings.append({
+                    "signal_type": "cluster",
                     "token_id": token_id,
                     "chain": chain,
                     "symbol": symbol,
@@ -315,6 +316,66 @@ def _find_firings(
                     i += 1
             else:
                 i += 1
+    return firings
+
+
+# ---------------------------------------------------------------------
+# Alpha solo firings
+# ---------------------------------------------------------------------
+
+ALPHA_ELITE_THRESHOLD = 3.0
+ALPHA_STRONG_THRESHOLD = 1.0
+ALPHA_COOLDOWN = 30 * 60
+
+
+def _find_alpha_firings(
+    token_id: str,
+    entries: list[dict],
+    wallet_to_cluster: dict[str, int],
+    cluster_size: dict[int, int],
+    alpha_scores: dict[str, float],
+) -> list[dict]:
+    """
+    For a given token, find single-wallet alpha firings.
+    A firing = wallet with alpha ≥ ALPHA_STRONG_THRESHOLD entered.
+    Per-(wallet, token) cooldown applied to avoid duplicate firings.
+    """
+    # Sort by entry_ts
+    entries_sorted = sorted(entries, key=lambda e: e["entry_ts"])
+    last_fired: dict[str, float] = {}
+
+    firings: list[dict] = []
+    for e in entries_sorted:
+        wallet = e["wallet"]
+        alpha = alpha_scores.get(wallet, 0.0)
+        if alpha < ALPHA_STRONG_THRESHOLD:
+            continue
+
+        # Per-wallet cooldown
+        last = last_fired.get(wallet, 0.0)
+        if e["entry_ts"] - last < ALPHA_COOLDOWN:
+            continue
+        last_fired[wallet] = e["entry_ts"]
+
+        cid = wallet_to_cluster.get(wallet)
+        tier = "elite" if alpha >= ALPHA_ELITE_THRESHOLD else "strong"
+
+        firings.append({
+            "signal_type": "alpha",
+            "alpha_tier": tier,
+            "token_id": token_id,
+            "chain": e.get("chain"),
+            "symbol": e.get("symbol"),
+            "cluster_id": cid,
+            "cluster_size_total": (
+                cluster_size.get(cid, 0) if cid is not None else 0
+            ),
+            "cluster_active_count": 1,
+            "wallets_involved": [wallet],
+            "first_entry_ts": e["entry_ts"],
+            "last_entry_ts": e["entry_ts"],
+            "time_window_seconds": 0,
+        })
     return firings
 
 
@@ -504,6 +565,39 @@ async def _simulate(
         token_age_hours=token_age_hours,
     )
 
+    # For alpha signals, override the conviction + status using the alpha
+    # formula from the live enricher so backtest and live agree.
+    signal_type = fire.get("signal_type") or "cluster"
+    if signal_type == "alpha":
+        from app.services.signal_enricher import (
+            _score_alpha_signal,
+            compute_momentum,
+        )
+        # We don't have live momentum data in backtest — approximate with
+        # the peak-vs-entry ratio over the hold window. This is a reasonable
+        # stand-in: "how much did this token move after entry?"
+        momentum_proxy = 0.0
+        if entry_price and peak_within_max and entry_price > 0:
+            up = (peak_within_max / entry_price) - 1.0
+            momentum_proxy = max(0.0, min(1.0, up / 1.0))
+
+        alpha_val = wallet_alphas[0] if wallet_alphas else 0.0
+        alpha_scored = _score_alpha_signal(
+            wallet_alpha=alpha_val,
+            momentum=momentum_proxy,
+            risk_score=75,
+            tvl_usd=tvl_usd,
+            age_hours=token_age_hours,
+        )
+        # Apply the strong-tier momentum gate
+        if fire.get("alpha_tier") == "strong" and momentum_proxy < 0.3:
+            alpha_scored["status"] = "watch"
+        scored = {
+            "conviction_score": alpha_scored["conviction_score"],
+            "breakdown": alpha_scored["conviction_breakdown"],
+            "status": alpha_scored["status"],
+        }
+
     outcome = "win" if (pnl_pct is not None and pnl_pct > 0) else (
         "loss" if pnl_pct is not None else "no_data"
     )
@@ -513,6 +607,8 @@ async def _simulate(
         hold_hours = round((exit_ts_used - entry_ts) / 3600.0, 2)
 
     return {
+        "signal_type": signal_type,
+        "alpha_tier": fire.get("alpha_tier"),
         "token_id": token_id,
         "chain": fire.get("chain"),
         "symbol": fire.get("symbol"),
@@ -538,6 +634,9 @@ async def _simulate(
         "tvl_usd": tvl_usd,
         "token_age_hours": token_age_hours,
         "wallet_alpha_scores": wallet_alphas,
+        "avg_alpha_score": round(
+            sum(wallet_alphas) / len(wallet_alphas), 3
+        ) if wallet_alphas else 0.0,
         "created_at": datetime.utcnow().isoformat(),
     }
 
@@ -579,10 +678,30 @@ async def run_honest_backtest(
         print(f"[backtest] found entries on {len(entries_by_token)} tokens")
 
         all_firings: list[dict] = []
+        cluster_count = 0
+        alpha_count = 0
         for token_id, entries in entries_by_token.items():
             fires = _find_firings(token_id, entries, w2c, cluster_size)
+            alpha_fires = _find_alpha_firings(
+                token_id, entries, w2c, cluster_size, alpha
+            )
+            # Dedup: if an alpha wallet's entry is already in a cluster firing
+            # on this token, drop the alpha firing for that wallet.
+            cluster_wallets_per_token = set()
+            for f in fires:
+                cluster_wallets_per_token.update(f["wallets_involved"])
+            alpha_fires = [
+                f for f in alpha_fires
+                if f["wallets_involved"][0] not in cluster_wallets_per_token
+            ]
             all_firings.extend(fires)
-        print(f"[backtest] cluster firings detected: {len(all_firings)}")
+            all_firings.extend(alpha_fires)
+            cluster_count += len(fires)
+            alpha_count += len(alpha_fires)
+        print(
+            f"[backtest] firings: {cluster_count} cluster + "
+            f"{alpha_count} alpha = {len(all_firings)} total"
+        )
 
         if not all_firings:
             return {
@@ -629,6 +748,22 @@ async def run_honest_backtest(
         if exec_only else 0
     )
 
+    # Per-type stats — cluster vs alpha
+    def _type_stats(records: list[dict]) -> dict:
+        if not records:
+            return {"count": 0, "wins": 0, "win_rate_pct": 0.0, "avg_pnl_pct": 0.0}
+        w = [r for r in records if r["outcome"] == "win"]
+        a = sum((r["realistic_pnl_pct"] or 0) for r in records) / len(records)
+        return {
+            "count": len(records),
+            "wins": len(w),
+            "win_rate_pct": round(len(w) / len(records) * 100, 2),
+            "avg_pnl_pct": round(a, 2),
+        }
+
+    cluster_records = [r for r in valid if r.get("signal_type") != "alpha"]
+    alpha_records = [r for r in valid if r.get("signal_type") == "alpha"]
+
     summary = {
         "tokens_scanned": len(entries_by_token),
         "firings_detected": len(all_firings),
@@ -648,6 +783,9 @@ async def run_honest_backtest(
             round(len(exec_wins) / len(exec_only) * 100, 2) if exec_only else 0.0
         ),
         "exec_avg_pnl_pct": round(exec_avg, 2),
+        # Per-signal-type breakdown
+        "cluster_stats": _type_stats(cluster_records),
+        "alpha_stats": _type_stats(alpha_records),
     }
 
     return {

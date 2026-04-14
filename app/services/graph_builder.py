@@ -200,13 +200,25 @@ def build_wallet_map(
         except (TypeError, ValueError):
             alpha = 0.0
 
+        # Normalize last_trade_time to unix seconds
+        last_trade_raw = meta.get("last_trade_time")
+        last_trade_ts: float | None = None
+        if last_trade_raw is not None:
+            try:
+                v = float(last_trade_raw)
+                if v > 1e12:
+                    v /= 1000.0
+                last_trade_ts = v if v > 0 else None
+            except (TypeError, ValueError):
+                last_trade_ts = None
+
         wallet_meta[addr] = {
             "chain": chain,
             "alpha_score": alpha,
             "total_profit": meta.get("total_profit"),
             "total_trades": meta.get("total_trades"),
             "total_volume": meta.get("total_volume"),
-            "last_trade_time": meta.get("last_trade_time"),
+            "last_trade_time": last_trade_ts,
         }
 
         for h in holdings.get(addr, []):
@@ -304,6 +316,8 @@ async def save_graph(
                     "alpha_score": meta.get("alpha_score", 0.0),
                     "total_profit": meta.get("total_profit"),
                     "total_trades": meta.get("total_trades"),
+                    "total_volume": meta.get("total_volume"),
+                    "last_trade_time": meta.get("last_trade_time"),
                     "tokens": appearances,
                     "last_updated": now,
                 },
