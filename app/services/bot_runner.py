@@ -26,6 +26,7 @@ from bson import ObjectId
 
 from app.db import mongo
 from app.services.ave_client import AveClient
+from app.services.balance_ledger import credit, try_debit
 from app.services.event_bus import (
     BOT_TRADE_CLOSED,
     BOT_TRADE_OPENED,
@@ -155,6 +156,17 @@ async def _open_position(
         print(f"[bot_runner] {bot_name} SKIP {tag}: computed size_usd={size_usd}")
         return
 
+    # Balance gate: refuse to open if the user's chain wallet can't cover it.
+    user_id = bot.get("user_id")
+    if user_id and chain:
+        debited = await try_debit(user_id, chain, size_usd)
+        if not debited:
+            print(
+                f"[bot_runner] {bot_name} SKIP {tag}: insufficient {chain} "
+                f"balance for ${size_usd:.2f} — fund wallet to enable"
+            )
+            return
+
     amount_tokens = size_usd / entry_price
     now = datetime.utcnow()
 
@@ -183,7 +195,14 @@ async def _open_position(
         "closed_at": None,
         "last_updated": now,
     }
-    res = await db.bot_trades.insert_one(doc)
+    try:
+        res = await db.bot_trades.insert_one(doc)
+    except Exception as e:
+        # Refund the debit since the trade never made it in
+        if user_id and chain:
+            await credit(user_id, chain, size_usd)
+        print(f"[bot_runner] insert failed for {tag}, refunded: {e}")
+        return
     doc["_id"] = str(res.inserted_id)
     doc["id"] = doc["_id"]
 
@@ -235,11 +254,22 @@ async def _close_position(
         },
     )
 
-    bot_id = trade["bot_id"]
-    inc = {"stats.pnl_usd": round(pnl_usd, 2)}
-    if pnl_usd > 0:
-        inc["stats.wins"] = 1
-    await db.bots.update_one({"_id": ObjectId(bot_id)}, {"$inc": inc})
+    # Credit the exit value back to the user's chain wallet (size + pnl).
+    user_id = trade.get("user_id")
+    chain = trade.get("chain")
+    exit_value = max(0.0, size_usd + pnl_usd)
+    if user_id and chain and exit_value > 0:
+        await credit(user_id, chain, exit_value)
+
+    bot_id = trade.get("bot_id")
+    if bot_id:
+        inc = {"stats.pnl_usd": round(pnl_usd, 2)}
+        if pnl_usd > 0:
+            inc["stats.wins"] = 1
+        try:
+            await db.bots.update_one({"_id": ObjectId(bot_id)}, {"$inc": inc})
+        except Exception:
+            pass
 
     payload = {
         "id": str(trade["_id"]),

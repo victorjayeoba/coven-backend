@@ -94,39 +94,70 @@ async def _load_solana_targets() -> set[str]:
 # ---------------------------------------------------------------------
 
 def _normalize_helius_swap(tx: dict, wallet: str) -> dict | None:
+    """
+    Fast path uses `events.swap` (Jupiter/Raydium/Orca). Fallback reconstructs
+    from `tokenTransfers` so Pump.fun/Meteora/UNKNOWN-tagged swaps come through.
+    """
+    ts = int(tx.get("timestamp") or time.time())
+
     events = (tx.get("events") or {}).get("swap")
-    if not isinstance(events, dict):
-        return None
+    if isinstance(events, dict):
+        def _filter_non_stable(toks: list[dict]) -> dict | None:
+            for t in toks or []:
+                mint = t.get("mint")
+                if mint and mint not in SOLANA_SKIP:
+                    return t
+            return None
 
-    def _filter_non_stable(toks: list[dict]) -> dict | None:
-        for t in toks or []:
-            mint = t.get("mint")
+        out_token = _filter_non_stable(events.get("tokenOutputs"))
+        in_token = _filter_non_stable(events.get("tokenInputs"))
+        side = None
+        token = None
+        if out_token:
+            side, token = "buy", out_token
+        elif in_token:
+            side, token = "sell", in_token
+        if side and token:
+            mint = token.get("mint")
             if mint and mint not in SOLANA_SKIP:
-                return t
+                return {
+                    "wallet": wallet,
+                    "token_id": f"{mint}-solana",
+                    "chain": "solana",
+                    "symbol": None,
+                    "timestamp": float(ts),
+                    "side": side,
+                    "tx_hash": tx.get("signature"),
+                    "amount_usd": None,
+                }
+
+    transfers = tx.get("tokenTransfers") or []
+    if not isinstance(transfers, list):
         return None
 
-    out_token = _filter_non_stable(events.get("tokenOutputs"))
-    in_token = _filter_non_stable(events.get("tokenInputs"))
+    received: dict | None = None
+    sent: dict | None = None
+    for t in transfers:
+        if not isinstance(t, dict):
+            continue
+        mint = t.get("mint")
+        if not mint or mint in SOLANA_SKIP:
+            continue
+        if t.get("toUserAccount") == wallet and received is None:
+            received = t
+        elif t.get("fromUserAccount") == wallet and sent is None:
+            sent = t
 
-    side = None
-    token = None
-    if out_token:
-        side = "buy"
-        token = out_token
-    elif in_token:
-        side = "sell"
-        token = in_token
+    if received:
+        side, token = "buy", received
+    elif sent:
+        side, token = "sell", sent
     else:
         return None
 
-    mint = token.get("mint")
-    if not mint or mint in SOLANA_SKIP:
-        return None
-
-    ts = int(tx.get("timestamp") or time.time())
     return {
         "wallet": wallet,
-        "token_id": f"{mint}-solana",
+        "token_id": f"{token['mint']}-solana",
         "chain": "solana",
         "symbol": None,
         "timestamp": float(ts),
@@ -169,8 +200,8 @@ async def _fetch_and_dispatch(client: httpx.AsyncClient, sig: str, wallet: str) 
         return
 
     tx = items[0]
-    if (tx.get("type") or "").upper() != "SWAP":
-        return
+    # Don't gate on type=="SWAP": Helius tags Pump.fun / Meteora / newer AMMs
+    # as UNKNOWN. The normalizer returns None for genuine non-swaps.
     ts = int(tx.get("timestamp") or 0)
     if ts and ts < int(_startup_ts):
         return

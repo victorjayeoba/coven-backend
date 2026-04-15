@@ -106,7 +106,9 @@ async def _load_targets() -> list[tuple[str, str]]:
 
 async def _poll_solana(client: httpx.AsyncClient, wallet: str) -> None:
     key = (wallet, "solana")
-    params = {"api-key": settings.helius_api_key, "type": "SWAP", "limit": 25}
+    # No `type=SWAP` filter — Helius tags Pump.fun / Meteora as UNKNOWN, and
+    # we'd rather reconstruct from tokenTransfers than miss those trades.
+    params = {"api-key": settings.helius_api_key, "limit": 25}
     url = f"{settings.helius_base_url}/v0/addresses/{wallet}/transactions"
 
     try:
@@ -156,63 +158,85 @@ async def _poll_solana(client: httpx.AsyncClient, wallet: str) -> None:
 
 def _normalize_helius_swap(tx: dict, wallet: str) -> dict | None:
     """
-    Helius enhanced-tx SWAP shape (summary):
-      { signature, timestamp, source, type: "SWAP",
-        events: { swap: { tokenInputs:[...], tokenOutputs:[...],
-                          nativeInput:{...}, nativeOutput:{...},
-                          innerSwaps:[...] } } }
+    Fast path: Helius's enhanced parser filled in `events.swap` (Jupiter,
+    Raydium, Orca). Fallback: reconstruct from `tokenTransfers` so we also
+    catch Pump.fun, Meteora, DFlow, and anything Helius tags as UNKNOWN.
 
-    A "buy" from the wallet's perspective = they received a non-stable token.
-    A "sell" = they gave up a non-stable token for stables/SOL.
+    Buy = wallet received a non-stable token. Sell = wallet sent one.
     """
+    ts = int(tx.get("timestamp") or time.time())
+
     events = (tx.get("events") or {}).get("swap")
-    if not isinstance(events, dict):
-        return None
+    if isinstance(events, dict):
+        def _filter_non_stable(toks: list[dict]) -> dict | None:
+            for t in toks or []:
+                mint = t.get("mint")
+                if mint and mint not in SOLANA_SKIP:
+                    return t
+            return None
 
-    def _filter_non_stable(toks: list[dict]) -> dict | None:
-        for t in toks or []:
-            mint = t.get("mint")
+        out_token = _filter_non_stable(events.get("tokenOutputs"))
+        in_token = _filter_non_stable(events.get("tokenInputs"))
+        side = None
+        token = None
+        if out_token:
+            side, token = "buy", out_token
+        elif in_token:
+            side, token = "sell", in_token
+        if side and token:
+            mint = token.get("mint")
             if mint and mint not in SOLANA_SKIP:
-                return t
+                return {
+                    "wallet": wallet,
+                    "token_id": f"{mint}-solana",
+                    "chain": "solana",
+                    "symbol": None,
+                    "timestamp": float(ts),
+                    "side": side,
+                    "tx_hash": tx.get("signature"),
+                    "amount_usd": None,
+                }
+
+    return _reconstruct_from_transfers(tx, wallet, ts)
+
+
+def _reconstruct_from_transfers(tx: dict, wallet: str, ts: int) -> dict | None:
+    """Derive buy/sell from raw tokenTransfers when events.swap is missing."""
+    transfers = tx.get("tokenTransfers") or []
+    if not isinstance(transfers, list):
         return None
 
-    out_token = _filter_non_stable(events.get("tokenOutputs"))  # received
-    in_token = _filter_non_stable(events.get("tokenInputs"))   # sent
+    received: dict | None = None
+    sent: dict | None = None
+    for t in transfers:
+        if not isinstance(t, dict):
+            continue
+        mint = t.get("mint")
+        if not mint or mint in SOLANA_SKIP:
+            continue
+        if t.get("toUserAccount") == wallet and received is None:
+            received = t
+        elif t.get("fromUserAccount") == wallet and sent is None:
+            sent = t
 
     side = None
     token = None
-    if out_token:
-        side = "buy"
-        token = out_token
-    elif in_token:
-        side = "sell"
-        token = in_token
+    if received:
+        side, token = "buy", received
+    elif sent:
+        side, token = "sell", sent
     else:
         return None
 
-    mint = token.get("mint")
-    if not mint or mint in SOLANA_SKIP:
-        return None
-
-    ts = int(tx.get("timestamp") or time.time())
-
-    # Amount in USD — Helius often gives nativeInput/Output (lamports). Convert loosely.
-    amount_usd: float | None = None
-    try:
-        raw = token.get("rawTokenAmount") or {}
-        # (we don't always have USD pricing; leave None and let bot_runner source it)
-    except Exception:
-        pass
-
     return {
         "wallet": wallet,
-        "token_id": f"{mint}-solana",
+        "token_id": f"{token['mint']}-solana",
         "chain": "solana",
-        "symbol": None,           # Helius doesn't always carry symbol
+        "symbol": None,
         "timestamp": float(ts),
         "side": side,
         "tx_hash": tx.get("signature"),
-        "amount_usd": amount_usd,
+        "amount_usd": None,
     }
 
 

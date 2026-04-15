@@ -25,6 +25,7 @@ from bson import ObjectId
 
 from app.config import settings
 from app.db import mongo
+from app.services.balance_ledger import credit, get_balance, try_debit
 from app.services.event_bus import BOT_TRADE_OPENED, bus
 from app.services.telegram_client import TelegramClient
 
@@ -315,6 +316,194 @@ async def _cmd_signals(tg: TelegramClient, chat: dict, _: list[str]) -> None:
             print(f"[telegram_poller] /signals send failed: {e}")
 
 
+# ---------------------------------------------------------------------
+# Copy-trade tracking
+# ---------------------------------------------------------------------
+
+import re
+
+_BSC_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_SOL_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # base58, no 0/O/I/l
+
+
+def _detect_chain(addr: str) -> str | None:
+    """Return 'bsc' / 'solana' / None based on address shape."""
+    addr = (addr or "").strip()
+    if _BSC_RE.match(addr):
+        return "bsc"
+    if _SOL_RE.match(addr):
+        return "solana"
+    return None
+
+
+async def _cmd_track(tg: TelegramClient, chat: dict, args: list[str]) -> None:
+    """
+    /track <wallet> [chain] [size]
+    Creates a copy-trade bot pointed at <wallet>. Defaults: $100 size,
+    TP +50%, SL -20%. Chain auto-detected from address shape.
+    """
+    user = await _user_from_chat(chat["id"])
+    if not user:
+        await tg.send_message(chat["id"], "Connect first — see the Notifications page.")
+        return
+
+    if not args:
+        await tg.send_message(
+            chat["id"],
+            "<b>Track a wallet · spin up a copy bot</b>\n\n"
+            "<code>/track &lt;address&gt;</code> — auto-detect chain, $100/trade\n"
+            "<code>/track &lt;address&gt; bsc</code> — force chain\n"
+            "<code>/track &lt;address&gt; sol 250</code> — set size\n\n"
+            "Defaults: TP <b>+50%</b>, SL <b>−20%</b>, copy exits on. "
+            "Manage with <code>/open</code> or stop with <code>/untrack &lt;address&gt;</code>.",
+        )
+        return
+
+    wallet = args[0].strip()
+    chain = _detect_chain(wallet)
+    explicit = None
+    size = float(TELEGRAM_QUICK_BUY_USD)
+
+    # Optional chain + size args
+    for a in args[1:]:
+        a_low = a.lower()
+        if a_low in NETWORK_ALIASES:
+            explicit = NETWORK_ALIASES[a_low]
+        else:
+            try:
+                size = float(a.replace(",", "").replace("$", ""))
+            except ValueError:
+                pass
+
+    if explicit:
+        chain = explicit
+    if not chain:
+        await tg.send_message(
+            chat["id"],
+            "❌ Couldn't tell which chain that address is on. "
+            "Add it: <code>/track ADDR sol</code> or <code>/track ADDR bsc</code>.",
+        )
+        return
+
+    if size <= 0 or size > 1_000_000:
+        await tg.send_message(chat["id"], "❌ Size must be $1 – $1,000,000.")
+        return
+
+    db = mongo.db()
+    user_id = str(user["_id"])
+
+    # Dup-guard: one active copy bot per (user, wallet, chain)
+    wallet_lc = wallet.lower()
+    dup = await db.bots.find_one({
+        "user_id": user_id,
+        "type": "copy",
+        "chain": chain,
+        "target_wallet_lc": wallet_lc,
+        "status": "active",
+    })
+    if dup:
+        await tg.send_message(
+            chat["id"],
+            f"You're already tracking <code>{wallet[:8]}…</code> on "
+            f"<b>{NETWORK_LABEL[chain]}</b>. Use <code>/untrack {wallet}</code> to stop.",
+        )
+        return
+
+    now = datetime.utcnow()
+    bot_doc = {
+        "user_id": user_id,
+        "name": f"TG · {wallet[:4]}…{wallet[-4:]}",
+        "type": "copy",
+        "status": "active",
+        "chain": chain,
+        "size_usd": float(size),
+        "size_mode": "fixed",
+        "multiplier": 1.0,
+        "percent_of_target": 5.0,
+        "target_wallet": wallet,
+        "target_wallet_lc": wallet_lc,
+        "target_label": "",
+        "copy_exits": True,
+        "min_conviction": 70,
+        "cluster_filter": "",
+        "take_profit_pct": 50.0,
+        "stop_loss_pct": 20.0,
+        "trailing_stop_pct": 0.0,
+        "max_slippage_pct": 3.0,
+        "max_concurrent": 5,
+        "daily_loss_limit_usd": 500.0,
+        "min_liquidity_usd": 10_000.0,
+        "cooldown_min": 15,
+        "anti_rug": True,
+        "stats": {"pnl_usd": 0.0, "trades": 0, "wins": 0},
+        "created_at": now,
+        "last_updated": now,
+    }
+    res = await db.bots.insert_one(bot_doc)
+    bot_id = str(res.inserted_id)
+
+    # Balance heads-up
+    bal = await get_balance(user_id, chain)
+    bal_line = (
+        f"\n💼 {NETWORK_LABEL[chain]} balance: <code>{_fmt_usd(bal)}</code>"
+        if bal >= size
+        else f"\n⚠️ Low balance: <code>{_fmt_usd(bal)}</code> on {NETWORK_LABEL[chain]} — "
+        f"run <code>/fund {int(size)} {chain[:3]}</code> to enable trades."
+    )
+
+    await tg.send_message(
+        chat["id"],
+        f"✅ <b>Tracking <code>{wallet[:6]}…{wallet[-4:]}</code></b>\n"
+        f"chain: <b>{NETWORK_LABEL[chain]}</b> · size: <b>{_fmt_usd(size)}</b>/trade\n"
+        f"TP +50% · SL −20% · copy exits ON"
+        f"{bal_line}",
+    )
+
+
+async def _cmd_untrack(tg: TelegramClient, chat: dict, args: list[str]) -> None:
+    user = await _user_from_chat(chat["id"])
+    if not user:
+        await tg.send_message(chat["id"], "Connect first.")
+        return
+
+    if not args:
+        # List currently tracked wallets
+        db = mongo.db()
+        rows = []
+        async for b in db.bots.find(
+            {"user_id": str(user["_id"]), "type": "copy", "status": "active"},
+            {"target_wallet": 1, "chain": 1},
+        ):
+            w = b.get("target_wallet") or ""
+            rows.append(f"• <code>{w[:6]}…{w[-4:]}</code> · {b.get('chain', '?').upper()}")
+        if not rows:
+            await tg.send_message(chat["id"], "You're not tracking any wallets.")
+            return
+        await tg.send_message(
+            chat["id"],
+            "<b>Currently tracking</b>\n" + "\n".join(rows) +
+            "\n\nStop one: <code>/untrack ADDR</code>",
+        )
+        return
+
+    wallet = args[0].strip()
+    wallet_lc = wallet.lower()
+    db = mongo.db()
+    res = await db.bots.delete_many({
+        "user_id": str(user["_id"]),
+        "type": "copy",
+        "target_wallet_lc": wallet_lc,
+    })
+    if res.deleted_count:
+        await tg.send_message(
+            chat["id"],
+            f"🛑 Stopped tracking <code>{wallet[:6]}…{wallet[-4:]}</code> "
+            f"({res.deleted_count} bot{'s' if res.deleted_count > 1 else ''} removed).",
+        )
+    else:
+        await tg.send_message(chat["id"], "No matching tracked wallet.")
+
+
 async def _cmd_open(tg: TelegramClient, chat: dict, _: list[str]) -> None:
     """
     List every open bot position for this user. Each row is an inline button —
@@ -435,16 +624,15 @@ async def _cmd_help(tg: TelegramClient, chat: dict, _: list[str]) -> None:
     await tg.send_message(
         chat["id"],
         "<b>Coven bot commands</b>\n"
-        "<code>/start CODE</code> — link your account\n"
-        "<code>/status</code> — check link state\n"
         "<code>/signals</code> — top 5 live signals · tap to buy\n"
         "<code>/open</code> — open positions · tap to manage\n"
+        "<code>/track ADDR</code> — start a copy bot on a wallet\n"
+        "<code>/untrack ADDR</code> — stop one (no arg = list)\n"
         "<code>/balance</code> — show paper wallet\n"
         "<code>/fund 500 sol</code> — deposit paper funds\n"
         "<code>/trades</code> — last 5 bot trades\n"
-        "<code>/pause</code> — pause all bots\n"
-        "<code>/resume</code> — resume all bots\n"
-        "<code>/unlink</code> — disconnect",
+        "<code>/pause</code> · <code>/resume</code> — toggle all bots\n"
+        "<code>/status</code> — link state · <code>/unlink</code> — disconnect",
     )
 
 
@@ -453,6 +641,9 @@ COMMANDS = {
     "/status": _cmd_status,
     "/signals": _cmd_signals,
     "/live": _cmd_signals,   # alias
+    "/track": _cmd_track,
+    "/copy": _cmd_track,     # alias
+    "/untrack": _cmd_untrack,
     "/open": _cmd_open,
     "/positions": _cmd_open,  # alias
     "/balance": _cmd_balance,
@@ -527,6 +718,18 @@ async def _execute_quick_buy(
         return
 
     size_usd = float(TELEGRAM_QUICK_BUY_USD)
+
+    # Balance gate
+    debited = await try_debit(user_id, chain, size_usd)
+    if not debited:
+        bal = await get_balance(user_id, chain)
+        await tg.answer_callback_query(
+            cb_id,
+            f"Insufficient {chain.upper()} balance (${bal:.2f}). Run /fund {int(size_usd)} {chain[:3]}.",
+            show_alert=True,
+        )
+        return
+
     amount = size_usd / price
     now = datetime.utcnow()
 
@@ -559,7 +762,13 @@ async def _execute_quick_buy(
         "closed_at": None,
         "last_updated": now,
     }
-    res = await db.bot_trades.insert_one(doc)
+    try:
+        res = await db.bot_trades.insert_one(doc)
+    except Exception as e:
+        # Refund debit on insert failure
+        await credit(user_id, chain, size_usd)
+        await tg.answer_callback_query(cb_id, f"Trade failed: {e}", show_alert=True)
+        return
     trade_id = str(res.inserted_id)
 
     # Publish so SSE + bot_position_monitor + frontend caches update
@@ -707,6 +916,13 @@ async def _execute_close(
         },
     )
 
+    # Credit exit value back to the user's chain wallet
+    chain = trade.get("chain")
+    size_usd = float((trade.get("entry") or {}).get("size_usd") or 0)
+    exit_value = max(0.0, size_usd + pnl_usd)
+    if chain and exit_value > 0:
+        await credit(str(user["_id"]), chain, exit_value)
+
     # Bump parent bot stats if this trade was tied to one
     bot_id = trade.get("bot_id")
     if bot_id:
@@ -799,6 +1015,18 @@ async def _execute_rebuy(
         return
 
     size_usd = float(TELEGRAM_QUICK_BUY_USD)
+
+    # Balance gate
+    debited = await try_debit(user_id, chain, size_usd)
+    if not debited:
+        bal = await get_balance(user_id, chain)
+        await tg.answer_callback_query(
+            cb_id,
+            f"Insufficient {chain.upper()} balance (${bal:.2f}). Run /fund {int(size_usd)} {chain[:3]}.",
+            show_alert=True,
+        )
+        return
+
     amount = size_usd / price
     now = datetime.utcnow()
 
@@ -827,7 +1055,13 @@ async def _execute_rebuy(
         "closed_at": None,
         "last_updated": now,
     }
-    res = await db.bot_trades.insert_one(doc)
+    try:
+        res = await db.bot_trades.insert_one(doc)
+    except Exception as e:
+        # Refund the debit since the trade never made it in
+        await credit(user_id, chain, size_usd)
+        await tg.answer_callback_query(cb_id, f"Trade failed: {e}", show_alert=True)
+        return
     new_id = str(res.inserted_id)
 
     await bus.publish(BOT_TRADE_OPENED, {

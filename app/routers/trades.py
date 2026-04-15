@@ -1,13 +1,15 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from bson import ObjectId
 
 from app.auth.dependencies import get_current_user
 from app.db import mongo
 from app.services.ave_client import AveClient
-from app.services.event_bus import TRADE_CLOSED, bus
+from app.services.balance_ledger import credit, try_debit
+from app.services.event_bus import BOT_TRADE_OPENED, TRADE_CLOSED, bus
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
@@ -239,6 +241,80 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
     }
 
 
+class OpenTradeBody(BaseModel):
+    token_id: str = Field(..., description="`<address>-<chain>` form used everywhere else")
+    size_usd: float = Field(..., gt=0)
+    symbol: str | None = None
+
+
+@router.post("/open")
+async def open_manual_trade(
+    body: OpenTradeBody, user: dict = Depends(get_current_user)
+):
+    """User-initiated paper swap (the wallet Swap button in the TopBar)."""
+    token_id = body.token_id.strip()
+    if "-" not in token_id:
+        raise HTTPException(status_code=400, detail="token_id must be <address>-<chain>")
+    chain = token_id.rsplit("-", 1)[1]
+    if chain not in ("solana", "bsc"):
+        raise HTTPException(status_code=400, detail=f"unsupported chain: {chain}")
+
+    # Reuse bot_runner's price resolver (AVE → Jupiter fallback) so manual
+    # swaps can hit Pump.fun / Raydium tokens too.
+    from app.services.bot_runner import _entry_price
+    entry_price = await _entry_price(token_id)
+    if not entry_price or entry_price <= 0:
+        raise HTTPException(status_code=502, detail="Could not fetch price for token")
+
+    size_usd = float(body.size_usd)
+    debited = await try_debit(user["id"], chain, size_usd)
+    if not debited:
+        raise HTTPException(status_code=400, detail=f"Insufficient {chain} balance")
+
+    amount_tokens = size_usd / entry_price
+    now = datetime.utcnow()
+    doc = {
+        "bot_id": None,                # manual trade, no parent bot
+        "user_id": user["id"],
+        "token_id": token_id,
+        "chain": chain,
+        "symbol": body.symbol,
+        "entry": {
+            "price_usd": entry_price,
+            "size_usd": round(size_usd, 2),
+            "amount_tokens": amount_tokens,
+            "timestamp": now,
+            "trigger": {"source": "manual"},
+        },
+        "exit": None,
+        "current_price_usd": entry_price,
+        "peak_price_usd": entry_price,
+        "take_profit_pct": 0.0,
+        "stop_loss_pct": 0.0,
+        "trailing_stop_pct": 0.0,
+        "status": "open",
+        "is_paper": True,
+        "source": "manual",
+        "opened_at": now,
+        "closed_at": None,
+        "last_updated": now,
+    }
+
+    db = mongo.db()
+    try:
+        res = await db.bot_trades.insert_one(doc)
+    except Exception as e:
+        await credit(user["id"], chain, size_usd)
+        raise HTTPException(status_code=500, detail=f"Trade insert failed: {e}")
+
+    doc["_id"] = str(res.inserted_id)
+    await bus.publish(
+        BOT_TRADE_OPENED,
+        {"trade_id": doc["_id"], "token_id": token_id, "source": "manual"},
+    )
+    return _clean_bot(doc)
+
+
 @router.post("/{trade_id}/close")
 async def close_trade(
     trade_id: str, user: dict = Depends(get_current_user)
@@ -312,7 +388,16 @@ async def close_trade(
         },
     )
 
-    # If this is a bot trade, also bump the parent bot's rollup stats
+    # If this is a bot trade, credit exit value back to the user's wallet
+    # and bump the parent bot's rollup stats
+    if is_bot_trade:
+        from app.services.balance_ledger import credit
+        chain = trade.get("chain")
+        user_id = trade.get("user_id")
+        exit_value = max(0.0, float(entry.get("size_usd") or 0) + pnl_usd)
+        if user_id and chain and exit_value > 0:
+            await credit(user_id, chain, exit_value)
+
     if is_bot_trade and trade.get("bot_id"):
         try:
             bot_oid = ObjectId(trade["bot_id"])
