@@ -419,6 +419,10 @@ async def run() -> None:
     last_discover = 0.0
 
     global _next_fire_at
+    # Set an initial estimate so the /api/system/next-scan-at endpoint has
+    # a value to return immediately, before the first poll finishes.
+    _next_fire_at = time.time() + POLL_INTERVAL
+
     while not _stop.is_set():
         try:
             async with AveClient() as ave:
