@@ -64,7 +64,14 @@ async def list_trades(
     limit: int = Query(50, ge=1, le=200),
 ):
     db = mongo.db()
-    q: dict = {}
+    uid_str = user["id"]
+    uid_variants: list = [uid_str]
+    try:
+        uid_variants.append(ObjectId(uid_str))
+    except Exception:
+        pass
+
+    q: dict = {"user_id": {"$in": uid_variants}}
     if status:
         q["status"] = status
 
@@ -76,14 +83,6 @@ async def list_trades(
         t["source"] = t.get("source") or "signal"
 
     bot_q = dict(q)
-    bot_q["user_id"] = user["id"]
-    uid_str = user["id"]
-    uid_variants: list = [uid_str]
-    try:
-        uid_variants.append(ObjectId(uid_str))
-    except Exception:
-        pass
-    bot_q["user_id"] = {"$in": uid_variants}
     bot_trades = [
         _clean_bot(d)
         async for d in db.bot_trades.find(bot_q).sort("opened_at", -1).limit(limit)
@@ -97,20 +96,25 @@ async def list_trades(
 @router.get("/active")
 async def active_trades(user: dict = Depends(get_current_user)):
     db = mongo.db()
-    sys_trades = [
-        _clean(d)
-        async for d in db.trades.find({"status": "open"}).sort("opened_at", -1)
-    ]
-    for t in sys_trades:
-        t["source"] = t.get("source") or "signal"
 
-    # Match user_id as string OR ObjectId — older bot_trades may have either form.
+    # Match user_id as string OR ObjectId — some legacy docs have either form.
     uid_str = user["id"]
     uid_variants: list = [uid_str]
     try:
         uid_variants.append(ObjectId(uid_str))
     except Exception:
         pass
+
+    # System trades and bot trades both scoped to this user — no more leakage
+    # from the legacy demo account.
+    sys_trades = [
+        _clean(d)
+        async for d in db.trades.find(
+            {"status": "open", "user_id": {"$in": uid_variants}}
+        ).sort("opened_at", -1)
+    ]
+    for t in sys_trades:
+        t["source"] = t.get("source") or "signal"
 
     bot_trades = [
         _clean_bot(d)
@@ -129,20 +133,22 @@ async def trade_history(
     limit: int = Query(100, ge=1, le=500),
 ):
     db = mongo.db()
-    sys_trades = [
-        _compute_hold_sec(_clean(d))
-        async for d in db.trades.find({"status": "closed"})
-        .sort("closed_at", -1)
-        .limit(limit)
-    ]
-    for t in sys_trades:
-        t["source"] = t.get("source") or "signal"
     uid_str = user["id"]
     uid_variants: list = [uid_str]
     try:
         uid_variants.append(ObjectId(uid_str))
     except Exception:
         pass
+    sys_trades = [
+        _compute_hold_sec(_clean(d))
+        async for d in db.trades.find(
+            {"status": "closed", "user_id": {"$in": uid_variants}}
+        )
+        .sort("closed_at", -1)
+        .limit(limit)
+    ]
+    for t in sys_trades:
+        t["source"] = t.get("source") or "signal"
     bot_trades = [
         _compute_hold_sec(_clean_bot(d))
         async for d in db.bot_trades.find(
@@ -191,7 +197,7 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
     except Exception:
         pass
 
-    sys_closed = await _agg(db.trades)
+    sys_closed = await _agg(db.trades, {"user_id": {"$in": uid_variants}})
     bot_closed = await _agg(db.bot_trades, {"user_id": {"$in": uid_variants}})
 
     total_pnl = (sys_closed.get("total_pnl_usd") or 0.0) + (
@@ -228,14 +234,16 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
 
     # Open positions — include bot_trades unrealized P&L by computing on the fly
-    open_count = await db.trades.count_documents({"status": "open"})
+    open_count = await db.trades.count_documents(
+        {"status": "open", "user_id": {"$in": uid_variants}}
+    )
     bot_open_count = await db.bot_trades.count_documents(
         {"status": "open", "user_id": {"$in": uid_variants}}
     )
 
     # Sys unrealized is already materialized on trade docs
     sys_unrealized_cur = db.trades.aggregate([
-        {"$match": {"status": "open"}},
+        {"$match": {"status": "open", "user_id": {"$in": uid_variants}}},
         {"$group": {"_id": None, "u": {"$sum": "$unrealized_pnl_usd"}}},
     ])
     sys_unrealized = (next(iter([d async for d in sys_unrealized_cur]), None) or {}).get("u") or 0.0

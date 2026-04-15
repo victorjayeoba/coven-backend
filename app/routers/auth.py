@@ -41,11 +41,18 @@ async def signup(payload: UserCreate, response: Response):
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    # New users start with $1,000 of paper capital on each supported chain so
+    # they can test signal bots + the swap without needing to fund anything.
     doc = {
         "email": payload.email.lower(),
         "password_hash": hash_password(payload.password),
         "created_at": datetime.utcnow(),
         "preferences": UserPreferences().model_dump(),
+        "paper_balances": {
+            "solana": 1000.0,
+            "bsc": 1000.0,
+        },
+        "paper_balances_updated_at": datetime.utcnow(),
     }
     result = await db.users.insert_one(doc)
     doc["_id"] = result.inserted_id
