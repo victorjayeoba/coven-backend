@@ -72,6 +72,16 @@ _snapshots: dict[str, dict[str, int]] = {}
 # topic_slug -> human-readable label (for logging / message formatting)
 _topic_labels: dict[str, str] = {}
 
+# Epoch seconds of the next scheduled rank-poll fire — exposed via /api/system
+# so the frontend can show a precise countdown to the next scan.
+_next_fire_at: float | None = None
+
+
+def next_fire_at() -> float | None:
+    """Returns the unix-epoch timestamp of the next rank-poll fire, or None
+    if the poller hasn't started or is between cycles."""
+    return _next_fire_at
+
 
 # ---------------------------------------------------------------------
 # Topic discovery
@@ -408,6 +418,7 @@ async def run() -> None:
     topics: list[tuple[str, str]] = []
     last_discover = 0.0
 
+    global _next_fire_at
     while not _stop.is_set():
         try:
             async with AveClient() as ave:
@@ -420,6 +431,8 @@ async def run() -> None:
         except Exception as e:
             print(f"[rank_poller] loop error: {e}")
 
+        # Update next-fire timestamp for the API to expose.
+        _next_fire_at = time.time() + POLL_INTERVAL
         try:
             await asyncio.wait_for(_stop.wait(), timeout=POLL_INTERVAL)
         except asyncio.TimeoutError:

@@ -28,6 +28,7 @@ from app.routers import (
     settings as settings_router,
     signals,
     stream,
+    system,
     telegram,
     tokens,
     trades,
@@ -144,6 +145,7 @@ app.include_router(settings_router.router)
 app.include_router(bots.router)
 app.include_router(telegram.router)
 app.include_router(balance.router)
+app.include_router(system.router)
 
 
 @app.get("/")
