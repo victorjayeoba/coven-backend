@@ -11,6 +11,7 @@ from app.jobs import (
     helius_stream,
     position_monitor,
     price_listener,
+    rank_poller,
     telegram_poller,
     tx_poller,
     wallet_poller,
@@ -72,6 +73,7 @@ async def lifespan(_: FastAPI):
         bot_position_monitor.run(), name="bot_position_monitor"
     )
     tg_task = asyncio.create_task(telegram_poller.run(), name="telegram_poller")
+    rank_task = asyncio.create_task(rank_poller.run(), name="rank_poller")
     tx_task = None
     if settings.enable_tx_poller:
         tx_task = asyncio.create_task(tx_poller.run(), name="tx_poller")
@@ -91,6 +93,7 @@ async def lifespan(_: FastAPI):
         position_monitor.stop()
         bot_position_monitor.stop()
         telegram_poller.stop()
+        rank_poller.stop()
         if tx_task is not None:
             tx_poller.stop()
         await asyncio.gather(
@@ -102,6 +105,7 @@ async def lifespan(_: FastAPI):
             pos_task,
             bot_pos_task,
             tg_task,
+            rank_task,
             tx_task if tx_task else asyncio.sleep(0),
             return_exceptions=True,
         )

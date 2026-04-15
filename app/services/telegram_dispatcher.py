@@ -24,14 +24,14 @@ from app.db import mongo
 from app.services.event_bus import (
     BOT_TRADE_CLOSED,
     BOT_TRADE_OPENED,
-    SIGNAL_FIRED,
+    SIGNAL_SCORED,
     bus,
 )
 from app.services.telegram_client import TelegramClient, send_to
 
-# Only surface signals worth acting on — below this conviction the button
-# would mostly be noise.
-SIGNAL_NOTIFY_MIN_CONVICTION = 50
+# Absolute floor — even if a user sets threshold=0 we won't spam them with
+# garbage signals. Individual users can raise this via preferences.conviction_threshold.
+SIGNAL_NOTIFY_HARD_FLOOR = 40
 
 # Default buy size for the inline "Buy $100" button.
 TELEGRAM_QUICK_BUY_USD = 100
@@ -60,17 +60,20 @@ def _fmt_pct(v: Any) -> str:
     return f"{sign}{n:.2f}%"
 
 
-async def _linked_chats(pref_key: str) -> list[int]:
-    """chat_ids for every user who opted in for this notification type."""
+async def _linked_chats(pref_key: str) -> list[tuple[int, int]]:
+    """
+    Returns (chat_id, conviction_threshold) for every user who opted in for
+    this notification type. Callers filter against the signal's conviction.
+    """
     db = mongo.db()
-    out: list[int] = []
+    out: list[tuple[int, int]] = []
     now = datetime.utcnow()
     cursor = db.users.find(
         {
             "telegram.chat_id": {"$exists": True},
             f"telegram.prefs.{pref_key}": {"$ne": False},
         },
-        {"telegram": 1},
+        {"telegram": 1, "preferences": 1},
     )
     async for u in cursor:
         tg = u.get("telegram") or {}
@@ -78,8 +81,14 @@ async def _linked_chats(pref_key: str) -> list[int]:
         if isinstance(mute, datetime) and mute > now:
             continue
         chat_id = tg.get("chat_id")
-        if isinstance(chat_id, int):
-            out.append(chat_id)
+        if not isinstance(chat_id, int):
+            continue
+        prefs = u.get("preferences") or {}
+        try:
+            threshold = int(prefs.get("conviction_threshold") or 70)
+        except (TypeError, ValueError):
+            threshold = 70
+        out.append((chat_id, max(SIGNAL_NOTIFY_HARD_FLOOR, threshold)))
     return out
 
 
@@ -179,9 +188,11 @@ def _fmt_trade_close(t: dict) -> str:
 
 async def on_signal_fired(payload: dict) -> None:
     conviction = int(payload.get("conviction_score") or 0)
-    if conviction < SIGNAL_NOTIFY_MIN_CONVICTION:
-        return  # below threshold → don't ping anyone
-    chats = await _linked_chats("signals")
+    if conviction < SIGNAL_NOTIFY_HARD_FLOOR:
+        return  # below the absolute floor — don't ping anyone
+    all_chats = await _linked_chats("signals")
+    # Per-user threshold: a user with conviction_threshold=80 won't see a 60 signal.
+    chats = [cid for cid, thresh in all_chats if conviction >= thresh]
     if not chats:
         return
 
@@ -209,14 +220,14 @@ async def on_bot_opened(payload: dict) -> None:
     chats = await _linked_chats("trades")
     if not chats:
         return
-    await _broadcast(chats, _fmt_trade_open(payload))
+    await _broadcast([cid for cid, _ in chats], _fmt_trade_open(payload))
 
 
 async def on_bot_closed(payload: dict) -> None:
     chats = await _linked_chats("trades")
     if not chats:
         return
-    await _broadcast(chats, _fmt_trade_close(payload))
+    await _broadcast([cid for cid, _ in chats], _fmt_trade_close(payload))
 
 
 # ---------------------------------------------------------------------
@@ -225,7 +236,7 @@ def register() -> None:
     if not settings.telegram_bot_token:
         print("[telegram_dispatcher] bot token missing — notifications disabled")
         return
-    bus.subscribe(SIGNAL_FIRED, on_signal_fired)
+    bus.subscribe(SIGNAL_SCORED, on_signal_fired)
     bus.subscribe(BOT_TRADE_OPENED, on_bot_opened)
     bus.subscribe(BOT_TRADE_CLOSED, on_bot_closed)
     print("[telegram_dispatcher] registered")
