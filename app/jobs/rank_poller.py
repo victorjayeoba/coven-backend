@@ -225,7 +225,11 @@ async def _fire_signal(
         "chain": chain,
         "symbol": symbol or None,
         "conviction_score": conviction,
-        "status": "watch" if conviction < 75 else "execute",
+        # Bot-runner triggers on "exec" / "partial". Map our score to those:
+        #   ≥ 75 → exec  (full execute)
+        #   ≥ 55 → partial (act with smaller size)
+        #   < 55 → watch
+        "status": "exec" if conviction >= 75 else ("partial" if conviction >= 55 else "watch"),
         "topics": topic_summary,
         "topics_count": len(topics_hit),
         "best_rank_jump": max((j for _, _, _, j in topics_hit), default=0),

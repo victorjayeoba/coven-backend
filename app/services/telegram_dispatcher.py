@@ -137,6 +137,15 @@ def _fmt_signal(sig: dict) -> str:
             if isinstance(sig.get("avg_alpha_score"), (int, float))
             else "alpha wallet"
         )
+    elif sig_type == "rank_stack":
+        topics = sig.get("topics") or []
+        topic_labels = [t.get("label") or t.get("topic") for t in topics if isinstance(t, dict)]
+        topic_labels = [t for t in topic_labels if t]
+        topics_count = sig.get("topics_count") or len(topic_labels)
+        best_jump = sig.get("best_rank_jump") or 0
+        labels_str = ", ".join(topic_labels[:4]) if topic_labels else f"{topics_count} topics"
+        jump_str = f" · ↑{best_jump}" if best_jump >= 10 else ""
+        detail = f"🔥 Stacked on {topics_count} · {labels_str}{jump_str}"
     else:
         detail = f"Cabal #{cluster_id} · {wallets} wallets piling in"
 

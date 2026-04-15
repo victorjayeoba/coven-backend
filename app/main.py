@@ -58,7 +58,10 @@ async def lifespan(_: FastAPI):
         print(f"[startup] signal dedupe failed: {e}")
     contagion_detector.register()
     signal_enricher.register()
-    execution_engine.register()
+    # execution_engine intentionally NOT registered — only user-created
+    # signal bots (via bot_runner) should open trades. The system-level
+    # auto-trader was double-firing on every signal.
+    # execution_engine.register()
     exit_monitor.register()
     bot_runner.register()
     telegram_dispatcher.register()

@@ -23,6 +23,12 @@ def _clean_bot(doc: dict) -> dict:
     """Shape a bot_trade row so it matches the main trades response."""
     doc["id"] = str(doc.pop("_id"))
     doc["source"] = "bot"
+    # Older bot_trades stored user_id / bot_id as ObjectId — stringify so
+    # FastAPI's JSON serializer doesn't choke.
+    if isinstance(doc.get("user_id"), ObjectId):
+        doc["user_id"] = str(doc["user_id"])
+    if isinstance(doc.get("bot_id"), ObjectId):
+        doc["bot_id"] = str(doc["bot_id"])
     # Unrealized P&L for open bot trades (trades collection has this materialized
     # by position_monitor; bot_trades rely on current_price_usd + entry).
     entry = doc.get("entry") or {}
@@ -71,16 +77,20 @@ async def list_trades(
 
     bot_q = dict(q)
     bot_q["user_id"] = user["id"]
+    uid_str = user["id"]
+    uid_variants: list = [uid_str]
+    try:
+        uid_variants.append(ObjectId(uid_str))
+    except Exception:
+        pass
+    bot_q["user_id"] = {"$in": uid_variants}
     bot_trades = [
         _clean_bot(d)
         async for d in db.bot_trades.find(bot_q).sort("opened_at", -1).limit(limit)
     ]
 
     merged = sys_trades + bot_trades
-    merged.sort(
-        key=lambda t: t.get("opened_at") or datetime.min,
-        reverse=True,
-    )
+    merged.sort(key=lambda t: str(t.get("opened_at") or ""), reverse=True)
     return merged[:limit]
 
 
@@ -93,17 +103,23 @@ async def active_trades(user: dict = Depends(get_current_user)):
     ]
     for t in sys_trades:
         t["source"] = t.get("source") or "signal"
+
+    # Match user_id as string OR ObjectId — older bot_trades may have either form.
+    uid_str = user["id"]
+    uid_variants: list = [uid_str]
+    try:
+        uid_variants.append(ObjectId(uid_str))
+    except Exception:
+        pass
+
     bot_trades = [
         _clean_bot(d)
         async for d in db.bot_trades.find(
-            {"status": "open", "user_id": user["id"]}
+            {"status": "open", "user_id": {"$in": uid_variants}}
         ).sort("opened_at", -1)
     ]
     merged = sys_trades + bot_trades
-    merged.sort(
-        key=lambda t: t.get("opened_at") or datetime.min,
-        reverse=True,
-    )
+    merged.sort(key=lambda t: str(t.get("opened_at") or ""), reverse=True)
     return merged
 
 
@@ -121,19 +137,22 @@ async def trade_history(
     ]
     for t in sys_trades:
         t["source"] = t.get("source") or "signal"
+    uid_str = user["id"]
+    uid_variants: list = [uid_str]
+    try:
+        uid_variants.append(ObjectId(uid_str))
+    except Exception:
+        pass
     bot_trades = [
         _compute_hold_sec(_clean_bot(d))
         async for d in db.bot_trades.find(
-            {"status": "closed", "user_id": user["id"]}
+            {"status": "closed", "user_id": {"$in": uid_variants}}
         )
         .sort("closed_at", -1)
         .limit(limit)
     ]
     merged = sys_trades + bot_trades
-    merged.sort(
-        key=lambda t: t.get("closed_at") or datetime.min,
-        reverse=True,
-    )
+    merged.sort(key=lambda t: str(t.get("closed_at") or ""), reverse=True)
     return merged[:limit]
 
 
@@ -165,8 +184,15 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
         cursor = collection.aggregate(pipe)
         return next(iter([d async for d in cursor]), None) or {}
 
+    uid_str = user["id"]
+    uid_variants: list = [uid_str]
+    try:
+        uid_variants.append(ObjectId(uid_str))
+    except Exception:
+        pass
+
     sys_closed = await _agg(db.trades)
-    bot_closed = await _agg(db.bot_trades, {"user_id": user["id"]})
+    bot_closed = await _agg(db.bot_trades, {"user_id": {"$in": uid_variants}})
 
     total_pnl = (sys_closed.get("total_pnl_usd") or 0.0) + (
         bot_closed.get("total_pnl_usd") or 0.0
@@ -204,7 +230,7 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
     # Open positions — include bot_trades unrealized P&L by computing on the fly
     open_count = await db.trades.count_documents({"status": "open"})
     bot_open_count = await db.bot_trades.count_documents(
-        {"status": "open", "user_id": user["id"]}
+        {"status": "open", "user_id": {"$in": uid_variants}}
     )
 
     # Sys unrealized is already materialized on trade docs
@@ -217,7 +243,7 @@ async def pnl_summary(user: dict = Depends(get_current_user)):
     # Bot unrealized — compute per-row since we don't materialize it
     bot_unrealized = 0.0
     async for d in db.bot_trades.find(
-        {"status": "open", "user_id": user["id"]},
+        {"status": "open", "user_id": {"$in": uid_variants}},
         {"entry.price_usd": 1, "entry.amount_tokens": 1, "current_price_usd": 1},
     ):
         entry = d.get("entry") or {}
