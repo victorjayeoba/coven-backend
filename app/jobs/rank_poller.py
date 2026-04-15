@@ -35,17 +35,34 @@ POLL_INTERVAL = 5 * 60           # seconds between polls
 TOPICS_PER_POLL = 100            # rows per topic
 MIN_TOPICS_FOR_SIGNAL = 2        # token must appear in ≥ this many topics
 RANK_JUMP_BONUS_MIN = 10         # climbing ≥ N positions adds bonus conviction
-MAX_TOPICS_WHITELIST = 6         # keep polling cost bounded
+MAX_TOPICS_WHITELIST = 10        # keep polling cost bounded
 
 # Topic slugs we care about. AVE doesn't publish a stable manifest, so we
 # loosely match on human names (see _pick_interesting_topics).
 TOPIC_HINTS = (
-    "gainer",      # "Top Gainers 1h", "Top Gainers 24h"
-    "volume",      # "Top Volume"
-    "momentum",    # "Momentum"
-    "trending",    # "Trending"
-    "heat",        # "Heat / hot"
+    "gainer",      # Top Gainers
+    "volume",      # Top Volume
+    "momentum",    # Momentum
+    "trending",    # Trending
+    "heat", "hot", # Heat / Hot
     "breakout",
+    "active",      # Most active
+    "swap", "tx",  # Swap activity
+    "holder",      # Holder growth
+    "smart",       # Smart money flow
+    "new",         # New listings
+    "buzz",
+    "rising",
+    "fdv", "mcap", # Cap leaders
+)
+
+# Pump-phase virtual topics — AVE's tokens_platform is a different endpoint
+# from /ranks but conceptually behaves the same (a leaderboard of tokens).
+# Treating them as topics lets a Pump.fun-active token stack with trending /
+# gainer for higher conviction.
+PUMP_TOPICS = (
+    ("pump_in_new", "Pump · entering new"),
+    ("pump_in_hot", "Pump · entering hot"),
 )
 
 _stop = asyncio.Event()
@@ -61,13 +78,22 @@ _topic_labels: dict[str, str] = {}
 # ---------------------------------------------------------------------
 
 def _coerce_list(data: Any) -> list[dict]:
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        for key in ("list", "data", "items", "result", "topics"):
+    """AVE wraps responses inconsistently — sometimes `data.list`, sometimes
+    just `list`, sometimes deeper. Walk the wrapper until we hit the array."""
+    seen = 0
+    while seen < 4:
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if not isinstance(data, dict):
+            return []
+        for key in ("list", "tokens", "data", "items", "result", "topics", "rows"):
             inner = data.get(key)
-            if isinstance(inner, list):
-                return [x for x in inner if isinstance(x, dict)]
+            if isinstance(inner, (list, dict)):
+                data = inner
+                break
+        else:
+            return []
+        seen += 1
     return []
 
 
@@ -123,6 +149,13 @@ async def _poll_topic(ave: AveClient, slug: str) -> list[tuple[str, str, str, in
         except Exception as e:
             print(f"[rank_poller] trending({chain}) fetch failed: {e}")
             return []
+    elif slug.startswith("pump_"):
+        # Pump-phase virtual topic via AVE's tokens_platform endpoint
+        try:
+            raw = await ave.tokens_platform(tag=slug, limit=TOPICS_PER_POLL)
+        except Exception as e:
+            print(f"[rank_poller] tokens_platform({slug}) failed: {e}")
+            return []
     else:
         try:
             raw = await ave.ranks(slug, limit=TOPICS_PER_POLL)
@@ -140,19 +173,32 @@ async def _poll_topic(ave: AveClient, slug: str) -> list[tuple[str, str, str, in
     return out
 
 
-def _compute_conviction(topics_count: int, best_rank_jump: int) -> int:
+def _compute_conviction(
+    topics_count: int,
+    best_rank_jump: int,
+    best_rank: int,
+) -> int:
     """
     Stack score: more topics = more conviction.
-      2 topics → 55
-      3 topics → 72
-      4 topics → 85
-      5+ topics → 95
-    Plus up to +10 for jumping ≥ RANK_JUMP_BONUS_MIN positions on any topic.
+      2 topics → 50  (base — most common case)
+      3 topics → 70
+      4 topics → 82
+      5+ topics → 92
+    Bonuses (additive, capped at 99):
+      +1..10 — climbed ≥10 positions on any topic since last poll
+      +5     — best rank ≤ 3 on any topic (top 3 anywhere)
+      +3     — best rank ≤ 10 on any topic (top 10 anywhere)
     """
-    base = {2: 55, 3: 72, 4: 85}.get(topics_count, 95 if topics_count >= 5 else 0)
+    base = {2: 50, 3: 70, 4: 82}.get(topics_count, 92 if topics_count >= 5 else 0)
+
     bonus = 0
     if best_rank_jump >= RANK_JUMP_BONUS_MIN:
-        bonus = min(10, best_rank_jump // 5)  # +1 per 5 positions jumped, capped
+        bonus += min(10, best_rank_jump // 5)
+    if best_rank <= 3:
+        bonus += 5
+    elif best_rank <= 10:
+        bonus += 3
+
     return min(99, base + bonus)
 
 
@@ -244,6 +290,12 @@ async def _discover_topics(ave: AveClient) -> list[tuple[str, str]]:
         if slug not in [s for s, _ in topics]:
             topics.append((slug, label))
 
+    # Pump-phase virtual topics — orthogonal data source. A token in
+    # pump_in_hot stacking with gainer/trending = real heat → high conviction.
+    for slug, label in PUMP_TOPICS:
+        if slug not in [s for s, _ in topics]:
+            topics.append((slug, label))
+
     if topics:
         print(
             f"[rank_poller] watching {len(topics)} topics: "
@@ -266,10 +318,20 @@ async def _one_pass(ave: AveClient, topics: list[tuple[str, str]]) -> None:
     per_token: dict[str, list[tuple[str, str, int, int]]] = {}
     # token_id -> (chain, symbol)
     meta: dict[str, tuple[str, str]] = {}
+    # diag: how many rows arrived per topic, and per-chain breakdown
+    per_topic_count: dict[str, tuple[int, int, int]] = {}  # slug -> (total, sol, bsc)
 
     for (slug, label), res in zip(topics, results):
-        if isinstance(res, Exception) or not res:
+        if isinstance(res, Exception):
+            print(f"[rank_poller] DIAG '{slug}' fetch raised: {res}")
             continue
+        if not res:
+            print(f"[rank_poller] DIAG '{slug}' returned 0 rows")
+            continue
+        sol_count = sum(1 for _, c, _, _ in res if c == "solana")
+        bsc_count = sum(1 for _, c, _, _ in res if c == "bsc")
+        per_topic_count[slug] = (len(res), sol_count, bsc_count)
+
         prev_snap = _snapshots.get(slug) or {}
         new_snap: dict[str, int] = {}
         for tid, chain, symbol, rank in res:
@@ -280,13 +342,49 @@ async def _one_pass(ave: AveClient, topics: list[tuple[str, str]]) -> None:
             meta.setdefault(tid, (chain, symbol))
         _snapshots[slug] = new_snap
 
+    # ---- Diagnostics ----
+    # Bucket tokens by how many topics they appear on
+    buckets: dict[int, int] = {}
+    overlap_examples: list[str] = []
+    for tid, hits in per_token.items():
+        n = len(hits)
+        buckets[n] = buckets.get(n, 0) + 1
+        if n >= 2 and len(overlap_examples) < 5:
+            chain, symbol = meta[tid]
+            topic_names = ",".join(label for _, label, _, _ in hits)
+            overlap_examples.append(f"{symbol or tid[:10]}({chain}) on [{topic_names}]")
+
+    diag_per_topic = " · ".join(
+        f"{slug}={cnt[0]} (sol={cnt[1]}, bsc={cnt[2]})"
+        for slug, cnt in per_topic_count.items()
+    )
+    diag_buckets = " · ".join(
+        f"{k}-topic={v}" for k, v in sorted(buckets.items(), reverse=True)
+    )
+    print(
+        f"[rank_poller] DIAG topics={diag_per_topic} | tokens={diag_buckets} | "
+        f"threshold>=N{MIN_TOPICS_FOR_SIGNAL}"
+    )
+    if overlap_examples:
+        print(f"[rank_poller] DIAG overlaps: {' | '.join(overlap_examples)}")
+    elif any(n >= MIN_TOPICS_FOR_SIGNAL for n in buckets.keys()):
+        pass  # handled by overlap_examples loop above
+    else:
+        print(
+            f"[rank_poller] DIAG NO OVERLAP — no token appeared on "
+            f"{MIN_TOPICS_FOR_SIGNAL}+ topics this pass. Likely cause: AVE's "
+            f"named topics return ETH/Base tokens, leaving 0 intersect with "
+            f"our SOL/BSC trending feeds."
+        )
+
     # Emit stacked signals
     for tid, hits in per_token.items():
         if len(hits) < MIN_TOPICS_FOR_SIGNAL:
             continue
         chain, symbol = meta[tid]
         best_jump = max((j for _, _, _, j in hits), default=0)
-        conviction = _compute_conviction(len(hits), best_jump)
+        best_rank = min((r for _, _, r, _ in hits), default=999)
+        conviction = _compute_conviction(len(hits), best_jump, best_rank)
         if conviction <= 0:
             continue
         try:

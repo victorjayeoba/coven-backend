@@ -197,6 +197,12 @@ async def on_signal_fired(signal: dict) -> None:
 
     signal_type = signal.get("signal_type") or "cluster"
 
+    # rank_stack signals self-score in rank_poller and publish SIGNAL_SCORED
+    # directly. The cluster/alpha formula here needs cluster wallet counts
+    # which they don't have — would overwrite their conviction with garbage.
+    if signal_type == "rank_stack":
+        return
+
     async with AveClient() as ave:
         risk_result = await risk_checker.check_token(token_id, ave=ave)
         ctx = await _fetch_token_context(token_id, ave)
