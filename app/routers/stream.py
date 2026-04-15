@@ -14,9 +14,13 @@ from fastapi.responses import StreamingResponse
 
 from app.auth.dependencies import get_current_user
 from app.services.event_bus import (
+    BOT_TRADE_CLOSED,
+    BOT_TRADE_OPENED,
+    BOT_UPDATED,
     PRICE_UPDATE,
     SIGNAL_FIRED,
     SIGNAL_SCORED,
+    SWAP_EVENT,
     bus,
 )
 
@@ -49,9 +53,37 @@ async def _signal_stream(request: Request) -> AsyncGenerator[bytes, None]:
         except asyncio.QueueFull:
             pass
 
+    async def _on_swap(payload: dict) -> None:
+        try:
+            queue.put_nowait(("swap", payload))
+        except asyncio.QueueFull:
+            pass
+
+    async def _on_bot_trade_opened(payload: dict) -> None:
+        try:
+            queue.put_nowait(("bot.trade.opened", payload))
+        except asyncio.QueueFull:
+            pass
+
+    async def _on_bot_trade_closed(payload: dict) -> None:
+        try:
+            queue.put_nowait(("bot.trade.closed", payload))
+        except asyncio.QueueFull:
+            pass
+
+    async def _on_bot_updated(payload: dict) -> None:
+        try:
+            queue.put_nowait(("bot.updated", payload))
+        except asyncio.QueueFull:
+            pass
+
     bus.subscribe(SIGNAL_FIRED, _on_fired)
     bus.subscribe(SIGNAL_SCORED, _on_scored)
     bus.subscribe(PRICE_UPDATE, _on_price)
+    bus.subscribe(SWAP_EVENT, _on_swap)
+    bus.subscribe(BOT_TRADE_OPENED, _on_bot_trade_opened)
+    bus.subscribe(BOT_TRADE_CLOSED, _on_bot_trade_closed)
+    bus.subscribe(BOT_UPDATED, _on_bot_updated)
 
     yield _format_sse("connected", {"status": "ok"})
 
@@ -70,6 +102,10 @@ async def _signal_stream(request: Request) -> AsyncGenerator[bytes, None]:
         bus.unsubscribe(SIGNAL_FIRED, _on_fired)
         bus.unsubscribe(SIGNAL_SCORED, _on_scored)
         bus.unsubscribe(PRICE_UPDATE, _on_price)
+        bus.unsubscribe(SWAP_EVENT, _on_swap)
+        bus.unsubscribe(BOT_TRADE_OPENED, _on_bot_trade_opened)
+        bus.unsubscribe(BOT_TRADE_CLOSED, _on_bot_trade_closed)
+        bus.unsubscribe(BOT_UPDATED, _on_bot_updated)
 
 
 @router.get("/signals")

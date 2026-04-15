@@ -176,6 +176,43 @@ async def token_candles(
             raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/{token_id}/txs")
+async def token_txs(
+    token_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    _: dict = Depends(get_current_user),
+):
+    """Recent swap transactions on this token's main pair."""
+    async with AveClient() as ave:
+        try:
+            detail = await ave.token_detail(token_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+        tok = detail.get("token") if isinstance(detail, dict) and isinstance(detail.get("token"), dict) else detail
+        if not isinstance(tok, dict):
+            return []
+
+        chain = tok.get("chain") or (token_id.split("-")[-1] if "-" in token_id else None)
+        pair_addr = (
+            tok.get("main_pair_address")
+            or tok.get("main_pair")
+            or tok.get("pair_address")
+        )
+        if not pair_addr and isinstance(tok.get("pairs"), list) and tok["pairs"]:
+            first = tok["pairs"][0]
+            if isinstance(first, dict):
+                pair_addr = first.get("pair") or first.get("pair_address")
+        if not pair_addr or not chain:
+            return []
+
+        pair_id = f"{pair_addr}-{chain}"
+        try:
+            return await ave.swap_transactions(pair_id, limit=limit)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.get("/{token_id}/risk")
 async def token_risk(token_id: str, _: dict = Depends(get_current_user)):
     async with AveClient() as ave:

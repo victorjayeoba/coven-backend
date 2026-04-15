@@ -6,24 +6,40 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import mongo
-from app.jobs import position_monitor, price_listener, tx_poller, ws_listener
+from app.jobs import (
+    bot_position_monitor,
+    helius_stream,
+    position_monitor,
+    price_listener,
+    telegram_poller,
+    tx_poller,
+    wallet_poller,
+    wallet_watcher,
+    ws_listener,
+)
 from app.routers import (
     auth,
     backtests,
+    balance,
+    bots,
     clusters,
     health,
     settings as settings_router,
     signals,
     stream,
+    telegram,
     tokens,
     trades,
     wallets,
 )
 from app.services import (
+    bot_runner,
     contagion_detector,
     execution_engine,
     exit_monitor,
+    signal_dedupe,
     signal_enricher,
+    telegram_dispatcher,
 )
 
 
@@ -33,14 +49,29 @@ async def lifespan(_: FastAPI):
     mongo.connect()
     index_stats = await contagion_detector.load_graph_index()
     print(f"[startup] graph index loaded: {index_stats}")
+    try:
+        dedupe_stats = await signal_dedupe.run()
+        if dedupe_stats.get("deleted"):
+            print(f"[startup] signal dedupe: {dedupe_stats}")
+    except Exception as e:
+        print(f"[startup] signal dedupe failed: {e}")
     contagion_detector.register()
     signal_enricher.register()
     execution_engine.register()
     exit_monitor.register()
+    bot_runner.register()
+    telegram_dispatcher.register()
 
     ws_task = asyncio.create_task(ws_listener.run(), name="ws_listener")
     price_task = asyncio.create_task(price_listener.run(), name="price_listener")
+    wallet_task = asyncio.create_task(wallet_watcher.run(), name="wallet_watcher")
+    poller_task = asyncio.create_task(wallet_poller.run(), name="wallet_poller")
+    helius_task = asyncio.create_task(helius_stream.run(), name="helius_stream")
     pos_task = asyncio.create_task(position_monitor.run(), name="position_monitor")
+    bot_pos_task = asyncio.create_task(
+        bot_position_monitor.run(), name="bot_position_monitor"
+    )
+    tg_task = asyncio.create_task(telegram_poller.run(), name="telegram_poller")
     tx_task = None
     if settings.enable_tx_poller:
         tx_task = asyncio.create_task(tx_poller.run(), name="tx_poller")
@@ -54,13 +85,23 @@ async def lifespan(_: FastAPI):
         # Shutdown
         ws_listener.stop()
         price_listener.stop()
+        wallet_watcher.stop()
+        wallet_poller.stop()
+        helius_stream.stop()
         position_monitor.stop()
+        bot_position_monitor.stop()
+        telegram_poller.stop()
         if tx_task is not None:
             tx_poller.stop()
         await asyncio.gather(
             ws_task,
             price_task,
+            wallet_task,
+            poller_task,
+            helius_task,
             pos_task,
+            bot_pos_task,
+            tg_task,
             tx_task if tx_task else asyncio.sleep(0),
             return_exceptions=True,
         )
@@ -93,6 +134,9 @@ app.include_router(trades.router)
 app.include_router(backtests.router)
 app.include_router(stream.router)
 app.include_router(settings_router.router)
+app.include_router(bots.router)
+app.include_router(telegram.router)
+app.include_router(balance.router)
 
 
 @app.get("/")

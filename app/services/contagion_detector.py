@@ -211,16 +211,49 @@ async def _try_fire_cluster(
     )
 
     payload = signal.model_dump(mode="json")
-    db = mongo.db()
-    result = await db.signals.insert_one(payload)
-    payload["id"] = str(result.inserted_id)
-    payload.pop("_id", None)
+    now = datetime.utcnow()
 
-    await bus.publish(SIGNAL_FIRED, payload)
+    # Upsert: one signal per (token, cluster). Subsequent fires of the same
+    # cabal on the same token update the existing doc — they represent the
+    # cabal piling in harder, not a separate event.
+    db = mongo.db()
+    filter_ = {
+        "signal_type": "cluster",
+        "token_id": token_id,
+        "cluster_id": cluster_id,
+    }
+    # On update: refresh everything that moves; keep first_entry_at stable.
+    update_fields = {k: v for k, v in payload.items() if k != "first_entry_at"}
+    update_fields["updated_at"] = now
+    update_fields["detected_at"] = now
+    insert_only = {
+        "first_entry_at": payload.get("first_entry_at"),
+        "created_at": now,
+    }
+    res = await db.signals.find_one_and_update(
+        filter_,
+        {
+            "$set": update_fields,
+            "$setOnInsert": insert_only,
+            "$inc": {"fire_count": 1},
+        },
+        upsert=True,
+        return_document=True,   # = ReturnDocument.AFTER
+    )
+
+    # Build the payload we'll publish with the canonical id
+    out = dict(res or {})
+    out["id"] = str(out.pop("_id")) if "_id" in out else payload.get("id")
+    for k in ("first_entry_at", "last_entry_at", "created_at", "updated_at", "detected_at"):
+        if isinstance(out.get(k), datetime):
+            out[k] = out[k].isoformat()
+
+    await bus.publish(SIGNAL_FIRED, out)
 
     print(
         f"[CONTAGION cluster] #{cluster_id} on {signal.symbol or token_id} "
-        f"({len(unique_wallets)}/{cluster_total} wallets, α={avg_alpha:.2f})"
+        f"({len(unique_wallets)}/{cluster_total} wallets, α={avg_alpha:.2f}) "
+        f"· fire_count={out.get('fire_count', 1)}"
     )
     return True
 
@@ -261,17 +294,45 @@ async def _try_fire_alpha(
 
     payload = signal.model_dump(mode="json")
     payload["alpha_tier"] = tier  # enricher + frontend read this
+    now = datetime.utcnow()
 
+    # Upsert: one alpha signal per (wallet, token). Re-fires on the same
+    # pair update the existing doc with fresh timestamp / tier / alpha score.
     db = mongo.db()
-    result = await db.signals.insert_one(payload)
-    payload["id"] = str(result.inserted_id)
-    payload.pop("_id", None)
+    filter_ = {
+        "signal_type": "alpha",
+        "token_id": token_id,
+        "wallets_involved": [wallet],
+    }
+    update_fields = {k: v for k, v in payload.items() if k != "first_entry_at"}
+    update_fields["updated_at"] = now
+    update_fields["detected_at"] = now
+    insert_only = {
+        "first_entry_at": payload.get("first_entry_at"),
+        "created_at": now,
+    }
+    res = await db.signals.find_one_and_update(
+        filter_,
+        {
+            "$set": update_fields,
+            "$setOnInsert": insert_only,
+            "$inc": {"fire_count": 1},
+        },
+        upsert=True,
+        return_document=True,
+    )
 
-    await bus.publish(SIGNAL_FIRED, payload)
+    out = dict(res or {})
+    out["id"] = str(out.pop("_id")) if "_id" in out else payload.get("id")
+    for k in ("first_entry_at", "last_entry_at", "created_at", "updated_at", "detected_at"):
+        if isinstance(out.get(k), datetime):
+            out[k] = out[k].isoformat()
+
+    await bus.publish(SIGNAL_FIRED, out)
 
     print(
         f"[CONTAGION alpha/{tier}] {wallet[:10]}… α={alpha:.2f} on "
-        f"{signal.symbol or token_id}"
+        f"{signal.symbol or token_id} · fire_count={out.get('fire_count', 1)}"
     )
     return True
 

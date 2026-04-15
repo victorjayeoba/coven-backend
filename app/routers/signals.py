@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.auth.dependencies import get_current_user
 from app.db import mongo
 from app.services.ave_client import AveClient
+from app.services import signal_dedupe
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 
@@ -15,6 +16,59 @@ router = APIRouter(prefix="/api/signals", tags=["signals"])
 def _clean(doc: dict) -> dict:
     doc["id"] = str(doc.pop("_id"))
     return doc
+
+
+@router.post("/dedupe")
+async def dedupe_signals(_: dict = Depends(get_current_user)):
+    """Manually collapse duplicate signals in Mongo."""
+    stats = await signal_dedupe.run()
+    return stats
+
+
+@router.get("/debug/duplicates")
+async def debug_duplicates(_: dict = Depends(get_current_user)):
+    """
+    Dump every signal grouped by (token_id, cluster_id) so we can see why
+    two rows on the same token aren't collapsing. Includes the types of
+    each key field — catches int/string mismatches, case differences, etc.
+    """
+    db = mongo.db()
+    pipeline = [
+        {"$match": {"signal_type": "cluster"}},
+        {
+            "$group": {
+                "_id": "$token_id",
+                "docs": {
+                    "$push": {
+                        "id": {"$toString": "$_id"},
+                        "cluster_id": "$cluster_id",
+                        "cluster_id_type": {"$type": "$cluster_id"},
+                        "token_id": "$token_id",
+                        "symbol": "$symbol",
+                        "cluster_active_count": "$cluster_active_count",
+                        "cluster_size_total": "$cluster_size_total",
+                        "conviction_score": "$conviction_score",
+                        "status": "$status",
+                        "detected_at": "$detected_at",
+                        "fire_count": "$fire_count",
+                        "created_at": "$created_at",
+                        "updated_at": "$updated_at",
+                    }
+                },
+                "n": {"$sum": 1},
+            }
+        },
+        {"$match": {"n": {"$gt": 1}}},
+        {"$sort": {"n": -1}},
+    ]
+    groups = []
+    async for g in db.signals.aggregate(pipeline):
+        groups.append({
+            "token_id": g.get("_id"),
+            "count": g.get("n"),
+            "docs": g.get("docs"),
+        })
+    return {"duplicate_groups": groups, "total_groups": len(groups)}
 
 
 @router.get("")
